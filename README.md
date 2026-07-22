@@ -1,14 +1,7 @@
-# E-Commerce Platform
+# Pricing Engine
 
-Modules:
+Handles:
 
-- Customer UI
-- Order Service
-
-Architecture:
-
-ecommerce-platform
-|
-└── order-service
-       |
-       └── pricing-engine
+- Price calculation
+- Discount calculation
+- Tax calculation

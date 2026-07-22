@@ -28,24 +28,45 @@
  * **no code-level import back into `order-service`** — the two sides are wired
  * together only through the serialized transport described above.
  *
- * ## Idempotency (in-memory, instance-lifetime, bounded)
+ * ## Idempotency (in-memory, bounded-window, best-effort)
  * Each {@link NotificationService} instance remembers which status-change
  * transitions it has already **successfully dispatched**, keyed by an unambiguous
  * encoded tuple of `(order.id, oldStatus, newStatus)`. A repeated call with the
  * same key is short-circuited and reported as a duplicate rather than dispatched a
  * second time. This de-duplication state is held **in memory only, with no
- * persistence** (per AAP Section 0.6.2): it protects against duplicate delivery
- * within a single process/instance lifetime and is reset when a new instance is
- * created or the process restarts. To avoid unbounded growth (CWE-400) the set is
- * capped and evicts its oldest entries FIFO once the cap is exceeded; a transition
- * evicted long after delivery could, in principle, be dispatched again.
+ * persistence** (per AAP Section 0.6.2) and is reset when a new instance is created
+ * or the process restarts.
+ *
+ * The guarantee is deliberately **bounded-window, best-effort — NOT an
+ * instance-lifetime guarantee.** To avoid unbounded memory growth (CWE-400) the
+ * processed-key set is capped at `maxProcessed` entries and evicts its oldest
+ * entries oldest-first (FIFO) once the cap is exceeded. Concretely: a transition is
+ * suppressed as a duplicate **only while its key still resides in the bounded
+ * window of the most recent `maxProcessed` successful dispatches**. Once a key has
+ * been evicted, a later replay of that same transition **can be dispatched again**.
+ * Callers that require a stronger (durable / whole-lifetime) guarantee must layer
+ * their own persistent de-duplication on top; this library does not provide it.
  *
  * ## Delivery integrity (await + retry-safe)
  * Delivery is awaited. A transition is added to the processed set **only after the
- * transport resolves successfully**. If the transport throws or rejects, the
- * pending state is cleared, the key is NOT marked processed, and the error
- * propagates to the caller so the event can be retried — a failed send is never
- * silently reported as delivered.
+ * transport resolves successfully**. If the transport throws (synchronously or
+ * asynchronously), rejects, or exceeds the delivery timeout, the pending in-flight
+ * state is cleared, the key is NOT marked processed, and the error propagates to
+ * the caller so the event can be retried — a failed send is never silently
+ * reported as delivered. Pending in-flight state is registered **before** the
+ * transport is ever invoked (delivery is deferred by a microtask), so even a
+ * transport that throws on its very first synchronous statement leaves the
+ * in-flight map clean and remains fully retryable.
+ *
+ * ## Resource bounds (timeout + backpressure)
+ * A transport that never settles cannot pin resources indefinitely: each delivery
+ * races an instance-configurable timeout (`deliveryTimeoutMs`) whose timer is
+ * cleared the instant the delivery settles (holding the event loop for at most the
+ * timeout window), and the number of concurrently in-flight deliveries is capped
+ * (`maxInFlight`). When the in-flight cap is reached, a brand-new transition is
+ * rejected with a backpressure error instead of being queued, so callers can slow
+ * down or retry later. Duplicate / already-in-flight calls are never rejected for
+ * capacity — they join the existing single dispatch.
  *
  * ## Pluggable transport (no concrete vendor)
  * Delivery is performed through a pluggable transport sink. A benign
@@ -81,6 +102,19 @@ const MAX_ORDER_ID_LENGTH = 512;
 /** Default cap on the in-memory processed-key set before FIFO eviction. */
 const DEFAULT_MAX_PROCESSED = 10000;
 
+/**
+ * Default cap on the number of concurrently in-flight deliveries before new
+ * transitions are refused with a backpressure error (CWE-400 availability guard).
+ */
+const DEFAULT_MAX_IN_FLIGHT = 1000;
+
+/**
+ * Default per-delivery timeout in milliseconds. A transport that neither resolves
+ * nor rejects within this window is treated as a failed delivery (and is therefore
+ * retryable), preventing a hung transport from pinning an in-flight slot forever.
+ */
+const DEFAULT_DELIVERY_TIMEOUT_MS = 30000;
+
 /** Maximum length of any single field emitted by the default log transport. */
 const MAX_LOG_FIELD_LENGTH = 128;
 
@@ -108,8 +142,17 @@ const MAX_LOG_FIELD_LENGTH = 128;
  *
  * @typedef {Object} NotificationServiceOptions
  * @property {number} [maxProcessed] Positive integer cap on the in-memory
- *   processed-key set before oldest-first eviction. Defaults to
- *   {@link DEFAULT_MAX_PROCESSED}.
+ *   processed-key (de-duplication) set before oldest-first eviction. Defaults to
+ *   {@link DEFAULT_MAX_PROCESSED}. This is the size of the bounded best-effort
+ *   de-duplication window (see the module idempotency section).
+ * @property {number} [maxInFlight] Positive integer cap on the number of
+ *   concurrently in-flight deliveries. When reached, a brand-new transition is
+ *   rejected with a backpressure error rather than queued. Defaults to
+ *   {@link DEFAULT_MAX_IN_FLIGHT}.
+ * @property {number} [deliveryTimeoutMs] Positive integer per-delivery timeout in
+ *   milliseconds. A transport that does not settle within this window is treated
+ *   as a failed (retryable) delivery. Defaults to
+ *   {@link DEFAULT_DELIVERY_TIMEOUT_MS}.
  */
 
 /**
@@ -122,7 +165,11 @@ const MAX_LOG_FIELD_LENGTH = 128;
  * @typedef {Object} OrderDTO
  * @property {string} id The unique order identifier (the identity key); must be a
  *   non-blank string no longer than {@link MAX_ORDER_ID_LENGTH} characters.
- * @property {string} [status] The order's current status, if provided.
+ * @property {string} [status] The order's current status, if provided. **When
+ *   present it must be a supported status equal to the transition's `newStatus`**
+ *   — a status-change event whose carried order status disagrees with the status
+ *   it transitioned TO is internally inconsistent and is rejected (see
+ *   {@link validateEvent}). Omit this field to send a status-agnostic event.
  * @property {number} [price] The order's price, if provided.
  */
 
@@ -173,8 +220,11 @@ function sanitizeForLog(value) {
  *
  * Enforces that `order` is a non-null, non-array object carrying a non-blank,
  * length-bounded string `id`; that both statuses belong to the supported
- * vocabulary; and that `oldStatus -> newStatus` is one of the exact permitted
- * lifecycle transitions.
+ * vocabulary; that `oldStatus -> newStatus` is one of the exact permitted
+ * lifecycle transitions; and that, **when the order carries its own `status`
+ * field, that field is a supported status equal to `newStatus`** so the event is
+ * internally consistent (an order claiming a status different from the one it just
+ * transitioned to is a malformed event and is rejected).
  *
  * @param {OrderDTO} order The order whose status changed.
  * @param {string} oldStatus The status transitioned FROM.
@@ -183,7 +233,8 @@ function sanitizeForLog(value) {
  * @throws {TypeError} If `order` is not a valid object or `order.id` is not a
  *   non-blank string.
  * @throws {RangeError} If `order.id` is too long, a status is outside the
- *   supported vocabulary, or the transition is not a permitted lifecycle pair.
+ *   supported vocabulary, the transition is not a permitted lifecycle pair, or a
+ *   present `order.status` is unsupported or does not equal `newStatus`.
  */
 function validateEvent(order, oldStatus, newStatus) {
   if (order === null || typeof order !== 'object' || Array.isArray(order)) {
@@ -211,6 +262,23 @@ function validateEvent(order, oldStatus, newStatus) {
     throw new RangeError(
       `invalid transition ${oldStatus} -> ${newStatus}`
     );
+  }
+  // Event-integrity guard: `order.status` is optional, but when supplied it must
+  // be a supported status that agrees with the status just transitioned TO. This
+  // rejects internally inconsistent events (e.g. an order marked DELIVERED carried
+  // on a CREATED -> CONFIRMED transition) instead of silently dispatching them.
+  if (order.status !== undefined) {
+    if (typeof order.status !== 'string' || !ORDER_STATUSES.has(order.status)) {
+      throw new RangeError(
+        `order.status must be one of CREATED, CONFIRMED, DELIVERED: ${JSON.stringify(order.status)}`
+      );
+    }
+    if (order.status !== newStatus) {
+      throw new RangeError(
+        `order.status ${JSON.stringify(order.status)} is inconsistent with the ` +
+          `transition target newStatus ${JSON.stringify(newStatus)}`
+      );
+    }
   }
 }
 
@@ -288,14 +356,18 @@ function normalizeTransport(transport) {
  * {@link NotificationService#sendStatusChangeNotification} and delivers each
  * notification through a pluggable transport.
  *
- * ## Idempotency contract
- * Every distinct `(order.id, oldStatus, newStatus)` transition is delivered to
- * the transport **at most once for the lifetime of a given instance**. Repeated
- * calls with the same key are short-circuited (not re-delivered) and reported as
- * duplicates in the returned {@link SendResult}. A transition is remembered
- * **only after a successful delivery**; a failed delivery is not remembered and
- * may be retried. The de-duplication set is held **in memory only, with no
- * persistence** (per AAP Section 0.6.2), and is bounded (oldest-first eviction).
+ * ## Idempotency contract (bounded-window, best-effort)
+ * Every distinct `(order.id, oldStatus, newStatus)` transition is delivered to the
+ * transport **at most once while its key remains within the bounded
+ * de-duplication window** — the most recent `maxProcessed` successful dispatches.
+ * Repeated calls with a key still inside that window are short-circuited (not
+ * re-delivered) and reported as duplicates in the returned {@link SendResult}. A
+ * transition is remembered **only after a successful delivery**; a failed delivery
+ * is not remembered and may be retried. The de-duplication set is held **in memory
+ * only, with no persistence** (per AAP Section 0.6.2), and is bounded with
+ * oldest-first (FIFO) eviction: once a key is evicted, a later replay of that
+ * transition **may dispatch again**. This is therefore a best-effort, bounded-
+ * window guarantee, **not** a durable or whole-instance-lifetime one.
  *
  * @example
  * // Default console transport
@@ -345,7 +417,8 @@ export class NotificationService {
     this._inFlight = new Map();
 
     /**
-     * Upper bound on {@link _processed} before oldest-first eviction (CWE-400).
+     * Upper bound on {@link _processed} (the bounded de-duplication window) before
+     * oldest-first eviction (CWE-400).
      *
      * @private
      * @type {number}
@@ -354,6 +427,33 @@ export class NotificationService {
       Number.isInteger(options.maxProcessed) && options.maxProcessed > 0
         ? options.maxProcessed
         : DEFAULT_MAX_PROCESSED;
+
+    /**
+     * Upper bound on the number of concurrently in-flight deliveries. New
+     * transitions are refused with a backpressure error once this many deliveries
+     * are already in flight, preventing unbounded {@link _inFlight} growth from a
+     * transport that never settles (CWE-400).
+     *
+     * @private
+     * @type {number}
+     */
+    this._maxInFlight =
+      Number.isInteger(options.maxInFlight) && options.maxInFlight > 0
+        ? options.maxInFlight
+        : DEFAULT_MAX_IN_FLIGHT;
+
+    /**
+     * Per-delivery timeout in milliseconds. A transport that does not settle within
+     * this window is treated as a failed (retryable) delivery so a hung transport
+     * cannot pin an in-flight slot indefinitely.
+     *
+     * @private
+     * @type {number}
+     */
+    this._deliveryTimeoutMs =
+      Number.isInteger(options.deliveryTimeoutMs) && options.deliveryTimeoutMs > 0
+        ? options.deliveryTimeoutMs
+        : DEFAULT_DELIVERY_TIMEOUT_MS;
   }
 
   /**
@@ -376,7 +476,14 @@ export class NotificationService {
 
   /**
    * Records a successfully dispatched key, evicting the oldest entries FIFO once
-   * the configured cap is exceeded to keep the set bounded (CWE-400).
+   * the configured cap ({@link _maxProcessed}) is exceeded to keep the set bounded
+   * (CWE-400).
+   *
+   * Because eviction is oldest-first, this implements the **bounded-window,
+   * best-effort** de-duplication described in the class idempotency contract:
+   * a key that has been evicted is no longer recognized as a duplicate, so a later
+   * replay of that transition can dispatch again. It is intentionally NOT a
+   * whole-lifetime guarantee.
    *
    * @private
    * @param {string} key The dedupe key to remember.
@@ -391,27 +498,97 @@ export class NotificationService {
   }
 
   /**
+   * Delivers a payload through the configured transport, racing the delivery
+   * against {@link _deliveryTimeoutMs} and guaranteeing the transport is invoked
+   * **asynchronously** (never on the caller's synchronous stack).
+   *
+   * The transport invocation is deferred onto a microtask, which has two
+   * important consequences:
+   * - a transport that throws **synchronously** surfaces that error as a promise
+   *   rejection (never as a synchronous throw out of this method), so the caller's
+   *   in-flight bookkeeping stays consistent and the transition remains retryable;
+   *   and
+   * - the returned promise settles exactly once — on transport resolution,
+   *   transport rejection, or timeout, whichever occurs first (subsequent
+   *   outcomes are ignored via the `settled` latch).
+   *
+   * The timeout timer is always cleared via `clearTimeout` the instant the
+   * delivery settles, so it never fires spuriously afterwards and holds the Node
+   * event loop for **at most** {@link _deliveryTimeoutMs} while a delivery is
+   * genuinely in progress. It is intentionally NOT `unref`'d: an `unref`'d timer
+   * can fail to fire in an otherwise-idle event loop, which would let a hung
+   * transport hang an awaiting caller forever and defeat the timeout's purpose.
+   *
+   * @private
+   * @param {NotificationPayload} payload The notification payload to deliver.
+   * @returns {Promise<void>} Resolves when the transport reports success; rejects
+   *   if the transport throws/rejects or the delivery exceeds
+   *   {@link _deliveryTimeoutMs}.
+   */
+  _deliverWithTimeout(payload) {
+    const timeoutMs = this._deliveryTimeoutMs;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`notification delivery timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      /**
+       * Settles the outer promise at most once and cancels the timeout timer.
+       * @param {(value?: unknown) => void} settle `resolve` or `reject`.
+       * @param {unknown} [arg] The value/reason to settle with.
+       * @returns {void}
+       */
+      const finish = (settle, arg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        settle(arg);
+      };
+      // Defer the transport call to a microtask: a synchronous throw becomes a
+      // rejection, and in-flight registration in the caller always runs first.
+      Promise.resolve()
+        .then(() => this._transport.send(payload))
+        .then(
+          () => finish(resolve),
+          (err) => finish(reject, err)
+        );
+    });
+  }
+
+  /**
    * Sends a notification for a single order status change — the authoritative
    * contract method mirroring the planned Java
    * `NotificationTrigger.onStatusChange`.
    *
    * ## Behavior
-   * 1. Validates the event (`order`/`order.id`, status vocabulary, and that
-   *    `oldStatus -> newStatus` is a permitted lifecycle transition).
-   * 2. If the transition was already dispatched by this instance, returns
+   * 1. Validates the event (`order`/`order.id`, status vocabulary, that
+   *    `oldStatus -> newStatus` is a permitted lifecycle transition, and — when
+   *    `order.status` is present — that it equals `newStatus`).
+   * 2. If the transition is still inside the bounded de-duplication window
+   *    (already successfully dispatched), returns
    *    `{ dispatched: false, duplicate: true, key }` without re-delivering.
-   * 3. If an identical transition is already in flight, awaits and returns that
-   *    single shared dispatch (no double-send).
-   * 4. Otherwise builds the payload, **awaits** delivery through the transport,
-   *    records the key **only on success**, and resolves with
+   * 3. If an identical transition is already in flight, returns that single shared
+   *    dispatch (no double-send); such calls are never rejected for capacity.
+   * 4. If the in-flight capacity ({@link _maxInFlight}) is already reached for a
+   *    brand-new transition, rejects with a backpressure error so the caller can
+   *    retry later.
+   * 5. Otherwise builds the payload and registers the in-flight promise **before**
+   *    the transport is invoked; delivery is deferred by a microtask and raced
+   *    against the per-delivery timeout ({@link _deliveryTimeoutMs}). On success it
+   *    records the key **only then** and resolves with
    *    `{ dispatched: true, duplicate: false, key, payload }`.
-   * 5. If delivery throws/rejects, the pending state is cleared, the key is NOT
-   *    remembered, and the error propagates so the caller can retry.
+   * 6. If delivery throws (synchronously or asynchronously), rejects, or times out,
+   *    the in-flight state is cleared, the key is NOT remembered, and the error
+   *    propagates so the caller can retry the transition.
    *
-   * The de-duplication state is in-memory only (no persistence, per AAP 0.6.2).
+   * The de-duplication state is in-memory only (no persistence, per AAP 0.6.2) and
+   * is a bounded, best-effort window (see the class idempotency contract).
    *
    * @param {OrderDTO} order The order whose status changed. Must be an object
-   *   carrying a non-blank, length-bounded string `id`.
+   *   carrying a non-blank, length-bounded string `id`; if it carries a `status`
+   *   it must equal `newStatus`.
    * @param {string} oldStatus The status transitioned FROM (one of
    *   `CREATED`/`CONFIRMED`/`DELIVERED`).
    * @param {string} newStatus The status transitioned TO (one of
@@ -421,9 +598,11 @@ export class NotificationService {
    *   dispatched: `{ dispatched: true, duplicate: false, key, payload }`. When a
    *   duplicate: `{ dispatched: false, duplicate: true, key }` (no `payload`).
    * @throws {TypeError} If `order`/`order.id` is invalid.
-   * @throws {RangeError} If a status is unsupported or the transition is invalid.
-   *   (Both surface as a rejected promise.) Any transport delivery error is also
-   *   propagated as a rejection.
+   * @throws {RangeError} If a status is unsupported, the transition is invalid, or
+   *   a present `order.status` disagrees with `newStatus`.
+   * @throws {Error} If the in-flight capacity is reached (backpressure) or the
+   *   transport delivery fails or times out. (All rejection reasons surface as a
+   *   rejected promise.)
    */
   async sendStatusChangeNotification(order, oldStatus, newStatus) {
     validateEvent(order, oldStatus, newStatus);
@@ -435,6 +614,15 @@ export class NotificationService {
     if (pending) {
       return pending;
     }
+    // Backpressure: refuse a brand-new transition once the in-flight cap is
+    // reached so a slow or hung transport cannot grow the in-flight map without
+    // bound (CWE-400). Duplicate and already-in-flight calls are handled above and
+    // never reach this check, so they are never rejected for capacity.
+    if (this._inFlight.size >= this._maxInFlight) {
+      throw new Error(
+        `notification delivery refused: in-flight capacity of ${this._maxInFlight} reached`
+      );
+    }
     /** @type {NotificationPayload} */
     const payload = {
       orderId: order.id,
@@ -442,9 +630,15 @@ export class NotificationService {
       newStatus,
       at: new Date().toISOString(),
     };
+    // Register the in-flight promise BEFORE the transport can run. Because
+    // `_deliverWithTimeout` defers the transport invocation to a microtask, the
+    // transport (and therefore the `finally` cleanup below) cannot execute until
+    // after `this._inFlight.set(key, attempt)` has run. This ordering is what
+    // makes even a synchronously-throwing transport fully retryable: the key the
+    // `finally` clears is guaranteed to have been installed first.
     const attempt = (async () => {
       try {
-        await this._transport.send(payload);
+        await this._deliverWithTimeout(payload);
         this._rememberKey(key);
         return { dispatched: true, duplicate: false, key, payload };
       } finally {

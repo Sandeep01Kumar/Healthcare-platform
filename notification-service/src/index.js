@@ -75,6 +75,17 @@ export default notificationService;
 // `process.argv[1]` is `undefined`); in that case we short-circuit rather than
 // letting `pathToFileURL(undefined)` throw, preserving the side-effect-light
 // import contract.
+//
+// The message states only what is actually true: the transport-agnostic library
+// (with its default console transport) is initialized. It deliberately does NOT
+// claim to be "listening" — this module binds no HTTP endpoint, port, queue
+// subscription, or IPC consumer (by design; see the module header). A producer
+// delivers events by invoking `sendStatusChangeNotification` through an injected
+// transport, not by connecting to a listener here.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  console.log('[notification-service] ready — listening for order status changes');
+  console.log(
+    '[notification-service] ready — transport-agnostic notification library ' +
+      'initialized with the default console transport; no listener is bound ' +
+      '(no HTTP endpoint, queue subscription, or IPC consumer).'
+  );
 }

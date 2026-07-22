@@ -16,19 +16,16 @@
     local repository BEFORE this module is built, because OrderService references
     the pricing-engine discount types on the compile classpath.
 
-  NON-STANDARD SOURCE LAYOUT (read carefully):
-    Per the repository convention, the main Java sources live at the MODULE ROOT
-    and are package-less (default/unnamed package):
-        OrderService.java, OrderStatus.java, Order.java, Coupon.java,
-        CouponValidator.java
-    Therefore <sourceDirectory> is the module root (${project.basedir}) and the
-    compiler is restricted with a SINGLE-LEVEL Ant glob (<include>*.java</include>)
-    so that ONLY the top-level root classes are compiled as main sources. The
-    non-recursive glob deliberately excludes:
-        - the nested pricing-engine/ directory (a SEPARATE module), and
-        - src/test/** (compiled instead as TEST sources).
-    Tests keep the Maven-standard testSourceDirectory (src/test/java), left at its
-    default so the JUnit 5 tests are picked up as test sources.
+  SOURCE LAYOUT (standard Maven):
+    Main Java sources live under src/main/java in the named package
+    `com.healthcare.order` (OrderService, OrderStatus, Coupon, and the later
+    Order, CouponValidator). Named packages are REQUIRED: the validation-side
+    `com.healthcare.order.Coupon` compiled here must coexist on the classpath
+    with the DISTINCT discount-side `com.healthcare.pricing.Coupon` pulled in
+    from the pricing-engine dependency. Package-less (default-package) classes
+    would collide by binary name across the two jars, so both modules are
+    namespaced. Tests live under src/test/java (Maven default) in the same
+    package and are picked up as TEST sources.
 
   OFFLINE VERSION PINS:
     Plugin/dependency versions are pinned to the artifacts already present in the
@@ -69,10 +66,13 @@
 
     <dependencies>
         <!--
-            Inter-module dependency on the pricing-engine artifact. Both modules
-            are package-less, so OrderService references the discount types
-            directly on the classpath (no import statements). Honors the AAP
-            build order: pricing-engine must be installed to the local repo first.
+            Inter-module dependency on the pricing-engine artifact. OrderService
+            references the discount types via their qualified package
+            `com.healthcare.pricing`. Honors the AAP build order: pricing-engine
+            must be installed to the local repo first. Because both modules are
+            namespaced, the discount-side `com.healthcare.pricing.Coupon` and the
+            validation-side `com.healthcare.order.Coupon` coexist on this module's
+            classpath with no binary-name collision.
         -->
         <dependency>
             <groupId>com.healthcare</groupId>
@@ -94,31 +94,20 @@
     </dependencies>
 
     <build>
-        <!--
-            Main sources live at the module root (package-less classes), NOT under
-            src/main/java. Combined with the single-level *.java include below, only
-            the top-level root classes are treated as main sources.
-        -->
-        <sourceDirectory>${project.basedir}</sourceDirectory>
-
         <plugins>
             <!--
-                maven-compiler-plugin: compiles ONLY the top-level root *.java files
-                as main sources. The single-level Ant glob "*.java" matches files in
-                the immediate source directory only and does NOT recurse, so the
-                nested pricing-engine/ module and src/test/** are excluded from the
-                main compilation. Java release level is taken from the
-                maven.compiler.release property above.
+                maven-compiler-plugin: standard Maven layout, so the default
+                source roots (src/main/java, src/test/java) are compiled. Java
+                release level is taken from the maven.compiler.release property
+                above. No source-directory override or include filter is needed;
+                the nested pricing-engine/ directory is a SEPARATE module and is
+                not under this module's src/main/java, so it is never swept into
+                this compilation.
             -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>${maven-compiler-plugin.version}</version>
-                <configuration>
-                    <includes>
-                        <include>*.java</include>
-                    </includes>
-                </configuration>
             </plugin>
 
             <!--

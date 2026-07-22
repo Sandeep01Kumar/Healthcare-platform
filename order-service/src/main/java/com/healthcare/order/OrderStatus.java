@@ -1,3 +1,5 @@
+package com.healthcare.order;
+
 /**
  * Order lifecycle status with a guarded, forward-only transition model.
  *

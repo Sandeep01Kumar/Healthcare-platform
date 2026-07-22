@@ -15,6 +15,16 @@
   ~ calculation for the order-commerce "Coupon and Order Tracking" feature.
   ~ It has NO server, persistence, or inter-module dependencies — it is a plain,
   ~ self-contained library jar with unit tests.
+  ~
+  ~ SOURCE LAYOUT (standard Maven):
+  ~   Production sources live under src/main/java in the named package
+  ~   `com.healthcare.pricing` (Coupon, DiscountCalculator, and the later
+  ~   CouponDiscountCalculator). A named package is REQUIRED here: the
+  ~   discount-side `com.healthcare.pricing.Coupon` published in this artifact
+  ~   must coexist on the downstream order-service classpath with the distinct
+  ~   validation-side `com.healthcare.order.Coupon`. Package-less (default-package)
+  ~   classes would collide by binary name across the two modules, so both
+  ~   modules are namespaced. Tests live under src/test/java in the same package.
   -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -83,41 +93,16 @@
     </dependencies>
 
     <build>
-        <!--
-          ~ NON-STANDARD SOURCE LAYOUT.
-          ~
-          ~ The project convention keeps the production Java classes
-          ~ (DiscountCalculator.java, Coupon.java, CouponDiscountCalculator.java)
-          ~ package-less at the MODULE ROOT rather than under src/main/java.
-          ~ We therefore point the main source directory at the module root.
-          ~
-          ~ The maven-compiler-plugin `<includes>` below restrict the main compile
-          ~ to a single directory level (`*.java`), so ONLY the root-level classes
-          ~ are treated as main sources; nested trees such as `src/test/**` and
-          ~ `target/**` are never swept into the main compilation.
-          ~
-          ~ `testSourceDirectory` is intentionally left at its Maven default
-          ~ (${project.basedir}/src/test/java) so the JUnit 5 tests are picked up
-          ~ as TEST sources by the normal test-compile / surefire lifecycle.
-          -->
-        <sourceDirectory>${project.basedir}</sourceDirectory>
-
         <plugins>
             <!--
-              ~ Compiler: Java 21 release, restricted to top-level *.java main sources.
-              ~ The single-level `*.java` glob (no `**/`) matches only files directly
-              ~ in the source root, which is exactly the three package-less classes;
-              ~ it does not recurse into src/test/** or target/**.
+              ~ Compiler: Java 21 release. Standard Maven layout is used, so the
+              ~ default source roots (src/main/java, src/test/java) are compiled;
+              ~ no source-directory override or include filter is needed.
               -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>${maven.compiler.plugin.version}</version>
-                <configuration>
-                    <includes>
-                        <include>*.java</include>
-                    </includes>
-                </configuration>
             </plugin>
 
             <!--

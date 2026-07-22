@@ -38,8 +38,11 @@ import java.util.List;
  * subtraction drives it below zero it is reset to {@code 0.00}. Flooring per step (rather
  * than only at the end) means a coupon can never push the subtotal negative and thereby
  * distort a subsequent {@code PERCENTAGE} coupon (a percentage of a negative number would
- * otherwise <i>increase</i> the total). Consequently the returned total is <b>always
- * {@code >= 0}</b>, even for an over-100% percentage stack or a fixed amount larger than the
+ * otherwise <i>increase</i> the total). The base {@code price} is likewise floored at zero
+ * <i>before</i> any coupon runs, so the guarantee also holds on the paths where no coupon is
+ * ever applied — an empty or {@code null} list, or a list whose entries are all skipped as
+ * malformed. Consequently the returned total is <b>always {@code >= 0}</b>, even for an
+ * over-100% percentage stack, a fixed amount larger than the price, or a negative input
  * price.</p>
  *
  * <h2>Monetary safety</h2>
@@ -48,16 +51,17 @@ import java.util.List;
  * results are free of binary floating-point rounding error.</p>
  *
  * <h2>Null / empty handling</h2>
- * <p>A {@code null} {@code price} is treated as {@code 0.00}. A {@code null} or empty
- * {@code coupons} list yields the price unchanged (the no-coupon baseline). Within the list,
- * any {@code null} coupon — or a coupon with a {@code null} {@link Coupon#getType()} or
- * {@code null} {@link Coupon#getValue()} — is <b>skipped</b> (treated as a no-op) so a single
- * malformed entry cannot corrupt the running subtotal.</p>
+ * <p>A {@code null} {@code price} is treated as {@code 0.00}, and a negative {@code price} is
+ * floored to {@code 0.00}. A {@code null} or empty {@code coupons} list yields the
+ * (normalized, zero-floored) price with no discount applied — the no-coupon baseline. Within
+ * the list, any {@code null} coupon — or a coupon with a {@code null} {@link Coupon#getType()}
+ * or {@code null} {@link Coupon#getValue()} — is <b>skipped</b> (treated as a no-op) so a
+ * single malformed entry cannot corrupt the running subtotal.</p>
  *
  * <p>This class is stateless and therefore immutable and thread-safe; a single instance may
- * be shared freely across threads. It lives in the default (unnamed) package by module
- * convention and depends on nothing outside the Java standard library and the same-module
- * {@link Coupon} value object.</p>
+ * be shared freely across threads. It lives in the {@code com.healthcare.pricing} package and
+ * depends on nothing outside the Java standard library and the same-package {@link Coupon}
+ * value object.</p>
  */
 public class CouponDiscountCalculator {
 
@@ -78,20 +82,29 @@ public class CouponDiscountCalculator {
      *
      * <p>Coupons stack deterministically in the list's iteration order against a running
      * subtotal, each {@code PERCENTAGE} or {@code FIXED} coupon reducing the subtotal left by
-     * the previous one. The subtotal is floored at {@code 0.00} after every coupon, so the
-     * returned total is always non-negative. See the class documentation for the full
-     * stacking policy and monetary-safety guarantees.</p>
+     * the previous one. The base price is floored at {@code 0.00} before any coupon runs and
+     * the subtotal is floored at {@code 0.00} after every coupon, so the returned total is
+     * always non-negative on every path. See the class documentation for the full stacking
+     * policy and monetary-safety guarantees.</p>
      *
-     * @param price   the base price before discounts; a {@code null} price is treated as
-     *                {@code 0.00}
+     * @param price   the base price before discounts; a {@code null} or negative price is
+     *                treated as {@code 0.00}
      * @param coupons the coupons to apply, in the order they should stack; a {@code null} or
-     *                empty list returns the price unchanged (no-coupon baseline), and any
+     *                empty list applies no discount and returns the zero-floored price, and any
      *                {@code null} coupon or coupon with a {@code null} type/value is skipped
      * @return the discounted total, normalized to {@code BigDecimal} scale 2 with
      *         {@link RoundingMode#HALF_UP}; never negative
      */
     public BigDecimal applyCoupons(BigDecimal price, List<Coupon> coupons) {
-        BigDecimal running = (price == null ? BigDecimal.ZERO : price).setScale(MONEY_SCALE, ROUNDING);
+        // Normalize the price to the monetary scale and floor it at zero UP FRONT. Flooring the
+        // base price here — not only inside the per-coupon loop below — is what makes the
+        // "never negative" guarantee hold on EVERY path: the no-coupon early return, a list of
+        // only skipped (malformed) coupons that never reach the in-loop floor, and the normal
+        // discounting path alike. For a non-negative price this is a no-op; it only ever clamps
+        // an atypical negative input up to 0.00.
+        BigDecimal running = (price == null ? BigDecimal.ZERO : price)
+                .setScale(MONEY_SCALE, ROUNDING)
+                .max(ZERO_MONEY);
 
         if (coupons == null || coupons.isEmpty()) {
             return running;

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.math.BigDecimal;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -128,5 +129,45 @@ public class DiscountCalculatorTest {
                 List.of(new Coupon("P100", Coupon.Type.PERCENTAGE, new BigDecimal("100"))));
         assertTrue(result.compareTo(BigDecimal.ZERO) >= 0, "the discounted total must never be negative");
         assertEquals(0, new BigDecimal("0.00").compareTo(result));
+    }
+
+    /**
+     * Case 4c — zero-floor on the no-coupon paths: a negative input {@code price} must still
+     * honor the "never negative" guarantee and return {@code 0.00}, even when no coupon ever
+     * subtracts from the subtotal. This exercises the base-price floor rather than the
+     * per-coupon floor, covering the three paths that skip the in-loop floor: a {@code null}
+     * coupon list, an empty list, and a list whose only entry is skipped as malformed. The
+     * contrast case (a real coupon) and the high-level {@link DiscountCalculator} facade are
+     * asserted too, so the guarantee is verified end-to-end.
+     */
+    @Test
+    void negativeInputPriceFlooredAtZero() {
+        CouponDiscountCalculator engine = new CouponDiscountCalculator();
+        BigDecimal negative = new BigDecimal("-50.00");
+
+        // No-coupon paths: a null list and an empty list must both floor a negative price to 0.00.
+        assertTrue(engine.applyCoupons(negative, null).compareTo(BigDecimal.ZERO) >= 0,
+                "a negative price with a null coupon list must never be negative");
+        assertEquals(0, new BigDecimal("0.00").compareTo(engine.applyCoupons(negative, null)),
+                "negative price + null coupon list must floor to 0.00");
+        assertEquals(0, new BigDecimal("0.00").compareTo(engine.applyCoupons(negative, List.of())),
+                "negative price + empty coupon list must floor to 0.00");
+
+        // All-malformed list: the per-coupon floor never runs (the sole entry is skipped), so
+        // the base-price floor must still guarantee a non-negative result.
+        assertEquals(0, new BigDecimal("0.00").compareTo(
+                        engine.applyCoupons(negative, Arrays.asList((Coupon) null))),
+                "negative price + all-skipped coupon list must floor to 0.00");
+
+        // Contrast: a negative price with a real coupon was already floored; it stays 0.00.
+        assertEquals(0, new BigDecimal("0.00").compareTo(
+                        engine.applyCoupons(negative,
+                                List.of(new Coupon("P10", Coupon.Type.PERCENTAGE, new BigDecimal("10"))))),
+                "negative price + a real coupon must floor to 0.00");
+
+        // The high-level DiscountCalculator facade inherits the same guarantee.
+        assertEquals(0, new BigDecimal("0.00").compareTo(
+                        new DiscountCalculator().calculate(negative, null)),
+                "DiscountCalculator facade must also floor a negative price to 0.00");
     }
 }

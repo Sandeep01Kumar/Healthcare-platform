@@ -24,7 +24,10 @@
   ~   must coexist on the downstream order-service classpath with the distinct
   ~   validation-side `com.healthcare.order.Coupon`. Package-less (default-package)
   ~   classes would collide by binary name across the two modules, so both
-  ~   modules are namespaced. Tests live under src/test/java in the same package.
+  ~   modules are namespaced. Tests live under src/test/java in the DEFAULT (unnamed)
+  ~   package and reference the production types through explicit imports of
+  ~   `com.healthcare.pricing.*` (an unnamed-package type may legally import from a
+  ~   named package).
   -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"

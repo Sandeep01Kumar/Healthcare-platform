@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+  order-service — Maven build (Coupon & Order Tracking feature)
+  ============================================================================
+  Build/test tooling for the order-service Java module. It hosts the mandated
+  JUnit 5 tests (OrderServiceTest, CouponValidatorTest) and produces a plain
+  JAR of the order domain classes.
+
+  CROSS-MODULE COORDINATION (must stay consistent with the pricing-engine pom):
+    groupId = com.healthcare, version = 1.0.0
+      - this module            -> artifactId = order-service
+      - the pricing-engine one -> artifactId = pricing-engine
+    Build order is pricing-engine -> order-service: the pricing-engine artifact
+    (com.healthcare:pricing-engine:1.0.0) MUST be `mvn install`-ed into the
+    local repository BEFORE this module is built, because OrderService references
+    the pricing-engine discount types on the compile classpath.
+
+  NON-STANDARD SOURCE LAYOUT (read carefully):
+    Per the repository convention, the main Java sources live at the MODULE ROOT
+    and are package-less (default/unnamed package):
+        OrderService.java, OrderStatus.java, Order.java, Coupon.java,
+        CouponValidator.java
+    Therefore <sourceDirectory> is the module root (${project.basedir}) and the
+    compiler is restricted with a SINGLE-LEVEL Ant glob (<include>*.java</include>)
+    so that ONLY the top-level root classes are compiled as main sources. The
+    non-recursive glob deliberately excludes:
+        - the nested pricing-engine/ directory (a SEPARATE module), and
+        - src/test/** (compiled instead as TEST sources).
+    Tests keep the Maven-standard testSourceDirectory (src/test/java), left at its
+    default so the JUnit 5 tests are picked up as test sources.
+
+  OFFLINE VERSION PINS:
+    Plugin/dependency versions are pinned to the artifacts already present in the
+    local Maven repository so the build succeeds fully offline.
+  ============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Module coordinates: EXACTLY com.healthcare:order-service:1.0.0 -->
+    <groupId>com.healthcare</groupId>
+    <artifactId>order-service</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Order Service</name>
+    <description>
+        Order lifecycle service: coupon validation API, order status handling
+        (CREATED -> CONFIRMED -> DELIVERED), and orchestration of the
+        pricing-engine coupon discount and status-change notifications.
+    </description>
+
+    <properties>
+        <!-- Java 21 (LTS) compile target/runtime via the compiler plugin. -->
+        <maven.compiler.release>21</maven.compiler.release>
+        <!-- Deterministic, platform-independent source encoding. -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Centralized, offline-present version pins (see header note). -->
+        <pricing-engine.version>1.0.0</pricing-engine.version>
+        <junit.jupiter.version>5.11.4</junit.jupiter.version>
+        <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
+        <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            Inter-module dependency on the pricing-engine artifact. Both modules
+            are package-less, so OrderService references the discount types
+            directly on the classpath (no import statements). Honors the AAP
+            build order: pricing-engine must be installed to the local repo first.
+        -->
+        <dependency>
+            <groupId>com.healthcare</groupId>
+            <artifactId>pricing-engine</artifactId>
+            <version>${pricing-engine.version}</version>
+        </dependency>
+
+        <!--
+            JUnit 5 (Jupiter) aggregator — test scope only. Pulls in the Jupiter
+            API, engine, and params modules for authoring and running the
+            order-service status-transition and coupon-validation tests.
+        -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!--
+            Main sources live at the module root (package-less classes), NOT under
+            src/main/java. Combined with the single-level *.java include below, only
+            the top-level root classes are treated as main sources.
+        -->
+        <sourceDirectory>${project.basedir}</sourceDirectory>
+
+        <plugins>
+            <!--
+                maven-compiler-plugin: compiles ONLY the top-level root *.java files
+                as main sources. The single-level Ant glob "*.java" matches files in
+                the immediate source directory only and does NOT recurse, so the
+                nested pricing-engine/ module and src/test/** are excluded from the
+                main compilation. Java release level is taken from the
+                maven.compiler.release property above.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <includes>
+                        <include>*.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+
+            <!--
+                maven-surefire-plugin: runs the JUnit 5 tests under src/test/java
+                non-interactively during the `test` phase (JUnit Platform provider).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

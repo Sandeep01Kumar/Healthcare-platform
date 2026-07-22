@@ -1,0 +1,25 @@
+{
+  "name": "customer-ui",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Customer UI: coupon input and order tracking for the order-commerce platform.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "vitest": "^2.1.0"
+  }
+}

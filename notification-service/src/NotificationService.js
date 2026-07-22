@@ -119,6 +119,17 @@ const DEFAULT_DELIVERY_TIMEOUT_MS = 30000;
 const MAX_LOG_FIELD_LENGTH = 128;
 
 /**
+ * Maximum length of a caller-supplied value echoed back inside a thrown
+ * validation error message.
+ *
+ * Mirrors {@link MAX_LOG_FIELD_LENGTH} so a rejected event carrying an oversized
+ * field (for example a 10 000-character status) cannot inflate the thrown Error
+ * message without bound — defense-in-depth against CWE-400-style amplification,
+ * consistent with the field-bounding the default log transport already applies.
+ */
+const MAX_ERROR_ECHO_LENGTH = 128;
+
+/**
  * A transport delivery function. Receives the fully-built notification payload
  * and delivers it through some sink (log, queue, HTTP call, etc.). May be
  * synchronous or asynchronous; when it returns a promise, that promise is awaited
@@ -216,6 +227,34 @@ function sanitizeForLog(value) {
 }
 
 /**
+ * Produces a length-bounded, JSON-encoded echo of a caller-supplied value for
+ * inclusion in a thrown validation error message.
+ *
+ * Untrusted input is echoed back so a rejection is actionable, but the echo is
+ * bounded to {@link MAX_ERROR_ECHO_LENGTH} — mirroring the field-bounding the
+ * default log transport applies via {@link sanitizeForLog} — so an oversized or
+ * malicious value cannot inflate the thrown Error message without bound
+ * (defense-in-depth). JSON encoding preserves the quoting/type cue that keeps
+ * the message readable while neutralizing embedded quotes; `undefined` (for
+ * which `JSON.stringify` yields no string) is rendered as the literal text
+ * `undefined`, preserving the prior display behavior.
+ *
+ * @param {*} value The (possibly untrusted) value to echo.
+ * @returns {string} A JSON-encoded, length-bounded representation.
+ */
+function echoForError(value) {
+  const encoded = JSON.stringify(value);
+  if (typeof encoded !== 'string') {
+    // `JSON.stringify(undefined)` returns `undefined` (not a string); render the
+    // literal text so the message reads identically to the previous behavior.
+    return String(encoded);
+  }
+  return encoded.length > MAX_ERROR_ECHO_LENGTH
+    ? `${encoded.slice(0, MAX_ERROR_ECHO_LENGTH)}…`
+    : encoded;
+}
+
+/**
  * Validates a status-change event before any dispatch or dedupe work.
  *
  * Enforces that `order` is a non-null, non-array object carrying a non-blank,
@@ -250,12 +289,12 @@ function validateEvent(order, oldStatus, newStatus) {
   }
   if (!ORDER_STATUSES.has(oldStatus)) {
     throw new RangeError(
-      `oldStatus must be one of CREATED, CONFIRMED, DELIVERED: ${JSON.stringify(oldStatus)}`
+      `oldStatus must be one of CREATED, CONFIRMED, DELIVERED: ${echoForError(oldStatus)}`
     );
   }
   if (!ORDER_STATUSES.has(newStatus)) {
     throw new RangeError(
-      `newStatus must be one of CREATED, CONFIRMED, DELIVERED: ${JSON.stringify(newStatus)}`
+      `newStatus must be one of CREATED, CONFIRMED, DELIVERED: ${echoForError(newStatus)}`
     );
   }
   if (VALID_TRANSITIONS.get(oldStatus) !== newStatus) {
@@ -270,13 +309,13 @@ function validateEvent(order, oldStatus, newStatus) {
   if (order.status !== undefined) {
     if (typeof order.status !== 'string' || !ORDER_STATUSES.has(order.status)) {
       throw new RangeError(
-        `order.status must be one of CREATED, CONFIRMED, DELIVERED: ${JSON.stringify(order.status)}`
+        `order.status must be one of CREATED, CONFIRMED, DELIVERED: ${echoForError(order.status)}`
       );
     }
     if (order.status !== newStatus) {
       throw new RangeError(
-        `order.status ${JSON.stringify(order.status)} is inconsistent with the ` +
-          `transition target newStatus ${JSON.stringify(newStatus)}`
+        `order.status ${echoForError(order.status)} is inconsistent with the ` +
+          `transition target newStatus ${echoForError(newStatus)}`
       );
     }
   }
@@ -284,9 +323,9 @@ function validateEvent(order, oldStatus, newStatus) {
 
 /**
  * Default transport used when no transport is injected into
- * {@link NotificationService}. It logs a single **structured** record to the
- * console with control-character-neutralized, length-bounded fields and performs
- * no other side effects.
+ * {@link NotificationService}. It logs a single **concise line** to the console
+ * with control-character-neutralized, length-bounded fields and performs no
+ * other side effects.
  *
  * This is intentionally a benign, side-effect-light default: it deliberately
  * does **not** integrate any concrete email/SMS/push vendor (per AAP Section
@@ -297,20 +336,28 @@ function validateEvent(order, oldStatus, newStatus) {
  */
 const defaultTransport = {
   /**
-   * Logs the notification as a single structured console record. All string
-   * fields are neutralized via {@link sanitizeForLog} so untrusted identifiers
-   * cannot forge additional log lines (CWE-117).
+   * Logs the notification as a **single concise, log-safe line**. Each field is
+   * neutralized via {@link sanitizeForLog}, which strips control characters so an
+   * untrusted identifier cannot forge or split log lines (CWE-117) and bounds
+   * each field's length. The record is emitted as one interpolated line rather
+   * than as an object argument, because `console.log(msg, obj)` pretty-prints the
+   * object across several physical lines whenever stdout is piped/redirected
+   * (the realistic non-TTY production configuration). Keeping the event on a
+   * single line preserves line-based log ingestion (journald, Loki, CloudWatch,
+   * `grep`), where one notification must be one record.
    *
    * @param {NotificationPayload} notification The notification to log.
    * @returns {void}
    */
   send(notification) {
-    console.log('[notification-service] order status change', {
-      orderId: sanitizeForLog(notification.orderId),
-      oldStatus: sanitizeForLog(notification.oldStatus),
-      newStatus: sanitizeForLog(notification.newStatus),
-      at: sanitizeForLog(notification.at),
-    });
+    const orderId = sanitizeForLog(notification.orderId);
+    const oldStatus = sanitizeForLog(notification.oldStatus);
+    const newStatus = sanitizeForLog(notification.newStatus);
+    const at = sanitizeForLog(notification.at);
+    console.log(
+      `[notification-service] order status change ` +
+        `orderId=${orderId} ${oldStatus} -> ${newStatus} at=${at}`
+    );
   },
 };
 

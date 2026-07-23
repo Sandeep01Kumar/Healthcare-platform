@@ -89,6 +89,45 @@ public class CouponValidatorTest {
     }
 
     /**
+     * Regression test for the coupon-code normalization contract (QA finding F1).
+     *
+     * <p>A {@link Coupon} canonicalizes its {@link Coupon#getCode() code} on construction
+     * (trimmed and upper-cased with {@code Locale.ROOT}), and the validator's registry is
+     * keyed by that canonical form. Realistic free-text input from the customer-ui coupon
+     * field is commonly lower-cased, mixed-cased, or padded with surrounding whitespace, so
+     * every such variant of a seeded code MUST resolve to the same coupon. Before the fix,
+     * {@link CouponValidator#validate(String)} looked the code up with the <i>raw</i> input
+     * while the registry was keyed by the <i>canonical</i> code, so {@code validate("save10")}
+     * and {@code validate(" SAVE10 ")} returned {@link CouponValidator#REASON_UNKNOWN_CODE}
+     * even though {@code SAVE10} was registered — an asymmetric, incomplete implementation of
+     * the documented canonicalization contract. This test pins the corrected, case- and
+     * whitespace-insensitive behavior across a spread of casing/whitespace variants and
+     * confirms each resolves to the canonical {@code SAVE10} coupon with its discount
+     * metadata intact.</p>
+     */
+    @Test
+    void couponLookupIsCaseAndWhitespaceInsensitive() {
+        CouponValidator validator = seededValidator();
+        String[] variants = {"save10", "Save10", "SAVE10", "sAvE10", " save10 ", "  SAVE10  ", "\tSave10\n"};
+        for (String variant : variants) {
+            CouponValidator.ValidationResult result = validator.validate(variant);
+            assertNormalized(result);
+            assertTrue(result.isValid(),
+                    "lookup must be case/whitespace-insensitive; '" + variant + "' should resolve SAVE10");
+            assertEquals(CouponValidator.REASON_OK, result.getReason(),
+                    "'" + variant + "' should validate with reason OK");
+            assertNotNull(result.getCoupon(),
+                    "'" + variant + "' must carry the resolved coupon");
+            assertEquals("SAVE10", result.getCoupon().getCode(),
+                    "'" + variant + "' must resolve to the canonical SAVE10 coupon");
+            assertEquals(Coupon.TYPE_PERCENTAGE, result.getType(),
+                    "'" + variant + "' must carry SAVE10's percentage discount type");
+            assertEquals(0, new BigDecimal("10").compareTo(result.getValue()),
+                    "'" + variant + "' must carry SAVE10's discount value of 10");
+        }
+    }
+
+    /**
      * Builds a {@link CouponValidator} seeded with three deterministic coupons that
      * exercise the accept, expired, and usage-limit-exceeded paths. The unknown-code
      * scenario is covered by validating a code that is deliberately NOT seeded here.

@@ -48,6 +48,16 @@ import java.util.Objects;
  * {@link #addCoupons(Collection)}, which makes deterministic test scenarios
  * (valid, not-yet-active, expired, usage-limit exceeded, unknown) easy to build.</p>
  *
+ * <p><b>Code normalization (case/whitespace-insensitive lookup).</b> Because a
+ * {@link Coupon} canonicalizes its {@link Coupon#getCode() code} on construction
+ * (trimmed and upper-cased with {@link java.util.Locale#ROOT}) and the registry is keyed
+ * by that canonical form, {@link #validate(String) validate} canonicalizes the submitted
+ * code the same way — through {@link Coupon#canonicalizeCode(String)} — before looking it
+ * up. Lookup is therefore case- and surrounding-whitespace-insensitive: a coupon
+ * registered as {@code SAVE10} resolves for {@code "save10"}, {@code "Save10"}, or
+ * {@code " SAVE10 "}. This matches the realistic free-text input a coupon UI field
+ * produces and keeps the storage and lookup sides of coupon identity in lock-step.</p>
+ *
  * <p><b>Time.</b> {@link #validate(String)} evaluates the validity window against
  * {@link LocalDate#now()} in the system default time zone. The
  * {@link #validate(String, LocalDate)} overload accepts an explicit "as of" date
@@ -216,8 +226,11 @@ public class CouponValidator {
      *       {@link #REASON_USAGE_LIMIT_EXCEEDED}.</li>
      * </ol>
      *
-     * @param code the coupon code to validate; a {@code null} or unrecognized code
-     *             yields {@link #REASON_UNKNOWN_CODE}
+     * @param code the coupon code to validate; it is canonicalized (trimmed and
+     *             upper-cased with {@link java.util.Locale#ROOT}) via
+     *             {@link Coupon#canonicalizeCode(String)} before lookup, so matching is
+     *             case- and surrounding-whitespace-insensitive; a {@code null} or
+     *             unrecognized code yields {@link #REASON_UNKNOWN_CODE}
      * @param asOf the date at which to evaluate the validity window; must not be
      *             {@code null}
      * @return a normalized {@link ValidationResult}; never {@code null}
@@ -226,8 +239,14 @@ public class CouponValidator {
     public ValidationResult validate(String code, LocalDate asOf) {
         Objects.requireNonNull(asOf, "asOf");
 
-        // 1. Existence: the code must resolve to a known coupon.
-        Coupon coupon = (code == null) ? null : registry.get(code);
+        // 1. Existence: the code must resolve to a known coupon. The registry is keyed by
+        //    each coupon's canonical code (Coupon.getCode()), so the raw input must be
+        //    canonicalized the SAME way (Coupon.canonicalizeCode) before lookup; otherwise a
+        //    differently-cased or whitespace-padded code — exactly what a free-text UI field
+        //    yields — would never match its registered coupon. canonicalizeCode is
+        //    null-safe (null -> null) and a canonically-empty/unknown code simply resolves
+        //    to no coupon via registry.get(...), preserving the "unknown code" outcome.
+        Coupon coupon = registry.get(Coupon.canonicalizeCode(code));
         if (coupon == null) {
             return ValidationResult.invalid(REASON_UNKNOWN_CODE);
         }

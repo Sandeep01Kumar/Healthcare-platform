@@ -86,10 +86,37 @@ public final class Coupon {
     private final int usageCount;
 
     /**
+     * Canonicalizes a raw coupon code to its single, authoritative identity form:
+     * {@linkplain String#trim() trimmed} and upper-cased with {@link Locale#ROOT}.
+     *
+     * <p>This is the <b>one</b> definition of coupon-code normalization in the
+     * order-service. Both the {@link Coupon} constructor — which stores the canonical
+     * {@link #getCode() code} that the {@code CouponValidator} registry is keyed by — and
+     * {@code CouponValidator}'s registry lookup route through this method, so a raw,
+     * user-entered code (any casing, with surrounding whitespace) maps to exactly the same
+     * identity on both the storage and the lookup side. Keeping the two in lock-step here
+     * is what prevents the registry from being populated under one form (the canonical
+     * {@code getCode()}) yet queried under another (the raw input) — the asymmetry that
+     * would otherwise reject realistic free-text coupon codes as unknown.</p>
+     *
+     * <p>{@link Locale#ROOT} is used deliberately so the mapping is locale-independent and
+     * deterministic (it avoids locale-specific upper-casing surprises such as the Turkish
+     * dotless-i). The method is {@code null}-safe: a {@code null} code canonicalizes to
+     * {@code null}, which callers treat as "no coupon".</p>
+     *
+     * @param code the raw coupon code; may be {@code null}
+     * @return the canonical code (trimmed, upper-cased with {@link Locale#ROOT}), or
+     *         {@code null} if {@code code} is {@code null}
+     */
+    public static String canonicalizeCode(String code) {
+        return code == null ? null : code.trim().toUpperCase(Locale.ROOT);
+    }
+
+    /**
      * Full constructor. Enforces every invariant so an invalid or contradictory coupon
      * cannot be constructed. The {@code code} is normalized to a canonical form (trimmed
-     * and upper-cased with {@link Locale#ROOT}); the {@code type} is likewise normalized
-     * and must be one of the supported constants.
+     * and upper-cased with {@link Locale#ROOT}) via {@link #canonicalizeCode(String)}; the
+     * {@code type} is likewise normalized and must be one of the supported constants.
      *
      * @param code       the coupon code identity (business key); non-null, non-blank
      * @param type       the discount type ({@link #TYPE_PERCENTAGE} or {@link #TYPE_FIXED});
@@ -126,7 +153,7 @@ public final class Coupon {
         if (value == null) {
             throw new NullPointerException("value must not be null");
         }
-        String normalizedCode = code.trim().toUpperCase(Locale.ROOT);
+        String normalizedCode = canonicalizeCode(code);
         if (normalizedCode.isEmpty()) {
             throw new IllegalArgumentException("code must not be blank");
         }

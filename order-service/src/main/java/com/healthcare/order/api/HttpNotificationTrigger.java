@@ -92,13 +92,52 @@ public class HttpNotificationTrigger implements OrderService.NotificationTrigger
         if (receiverUrl.isBlank()) {
             throw new IllegalArgumentException("receiverUrl must not be blank");
         }
+        URI parsed;
         try {
-            this.receiverUri = URI.create(receiverUrl);
+            parsed = URI.create(receiverUrl);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("receiverUrl is not a valid URI: " + receiverUrl, e);
         }
+        // CONFIG-01: the receiver URL must be an ABSOLUTE http(s) URL that carries a host.
+        // URI.create happily accepts a bare relative reference such as
+        // "relative-notification-path" (no scheme, no authority); left unchecked, that only blows
+        // up much later inside onStatusChange() when HttpRequest.newBuilder rejects the
+        // non-absolute URI — by which point the status transition has already committed and the
+        // event is stranded PENDING with the service otherwise reporting healthy. Validating the
+        // authority here makes a misconfiguration fail fast at construction, and therefore at
+        // application startup (before the HTTP server ever reports "listening").
+        requireAbsoluteHttpUri(parsed, receiverUrl);
+        this.receiverUri = parsed;
         this.httpClient = Objects.requireNonNull(httpClient, "httpClient");
         this.timeout = Objects.requireNonNull(timeout, "timeout");
+    }
+
+    /**
+     * Validates that the receiver URI is an absolute {@code http}/{@code https} URL with a host
+     * (finding CONFIG-01). Rejects relative references (no scheme), non-HTTP schemes, and
+     * authority-less URIs so a misconfigured {@code NOTIFICATION_URL} fails fast at startup rather
+     * than after the first (already-committed) status transition.
+     *
+     * @param uri      the parsed receiver URI
+     * @param original the original URL string, echoed in the error for operator clarity
+     * @throws IllegalArgumentException if {@code uri} is not an absolute http(s) URL with a host
+     */
+    private static void requireAbsoluteHttpUri(URI uri, String original) {
+        if (!uri.isAbsolute() || uri.getScheme() == null) {
+            throw new IllegalArgumentException(
+                    "receiverUrl must be an absolute URL with an http/https scheme, e.g. "
+                            + "http://127.0.0.1:3001/notifications; got: " + original);
+        }
+        String scheme = uri.getScheme().toLowerCase(java.util.Locale.ROOT);
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            throw new IllegalArgumentException(
+                    "receiverUrl scheme must be http or https; got: " + original);
+        }
+        if (uri.getHost() == null || uri.getHost().isBlank()) {
+            throw new IllegalArgumentException(
+                    "receiverUrl must include a host, e.g. http://127.0.0.1:3001/notifications; "
+                            + "got: " + original);
+        }
     }
 
     /**

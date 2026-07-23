@@ -635,13 +635,19 @@ async function startSpyReceiver(serviceOptions) {
  *
  * @param {string} baseUrl The receiver base URL.
  * @param {unknown} body The body to send.
- * @param {{ raw?: boolean, path?: string }} [opts] Encoding/route options.
+ * @param {{ raw?: boolean, path?: string, contentType?: string | null }} [opts]
+ *   Encoding/route options. `contentType` overrides the request media type
+ *   (default `application/json`); pass `null` to omit the header entirely.
  * @returns {Promise<Response>} The fetch response.
  */
-function postEvent(baseUrl, body, { raw = false, path = '/notifications' } = {}) {
+function postEvent(baseUrl, body, { raw = false, path = '/notifications', contentType = 'application/json' } = {}) {
+  const headers = {};
+  if (contentType !== null) {
+    headers['Content-Type'] = contentType;
+  }
   return fetch(`${baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: raw ? body : JSON.stringify(body),
   });
 }
@@ -758,23 +764,135 @@ test('C6: an unknown route is rejected (404)', async () => {
   }
 });
 
-test('C6: an oversized body is refused without dispatch (bounded input, CWE-400)', async () => {
+test('C6/API-04: an oversized body is refused with a CLEAN 413 (not a socket reset)', async () => {
   const rec = await startSpyReceiver();
   try {
-    // Exceed MAX_BODY_BYTES (64 KiB) so the receiver caps the read.
+    // Exceed MAX_BODY_BYTES (64 KiB) so the receiver caps the read. The receiver
+    // must answer with a deterministic 413 JSON and close the connection
+    // gracefully — NOT reset the socket — so the fetch MUST resolve. A thrown
+    // fetch (connection reset) is the exact API-04 defect and is now a failure.
     const huge = 'x'.repeat(70 * 1024);
-    let status = 0;
-    try {
-      const res = await postEvent(rec.baseUrl, huge, { raw: true });
-      status = res.status;
-    } catch {
-      // The receiver destroys the request stream when the cap is exceeded, which a
-      // client can observe as a dropped connection rather than a clean 413. Either
-      // outcome proves the oversized body was refused before any dispatch.
-      status = 413;
-    }
-    assert.ok(status === 413 || status === 400, `oversized body must be refused (got ${status})`);
+    const res = await postEvent(rec.baseUrl, huge, { raw: true });
+    assert.equal(res.status, 413, 'an oversized body must be refused with a clean 413');
+    assert.match(
+      res.headers.get('content-type') || '',
+      /application\/json/i,
+      'the 413 must be JSON'
+    );
+    // SEC-02: the security headers must be present even on the 413.
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    const body = await res.json();
+    assert.match(body.error.message, /too large/i, 'the 413 body must explain the cap');
     assert.equal(rec.transport.calls.length, 0, 'an oversized body must never be dispatched');
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6/API-01: a non-JSON Content-Type is rejected (415) before any parse or dispatch', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    // A syntactically-valid JSON body, but mislabelled as text/plain: it must be
+    // refused with 415 up front, never parsed and never dispatched.
+    const res = await postEvent(rec.baseUrl, contractFEvent(), { contentType: 'text/plain' });
+    assert.equal(res.status, 415, 'a non-JSON media type must be rejected with 415');
+    const body = await res.json();
+    assert.match(body.error.message, /application\/json/i);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(rec.transport.calls.length, 0, 'a mislabelled body must never be dispatched');
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6/INT-02: a nested order.id that disagrees with the top-level orderId is rejected (400)', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    // The receiver must not silently pick one identity over a conflicting other;
+    // an internally inconsistent event is refused and never dispatched.
+    const res = await postEvent(
+      rec.baseUrl,
+      contractFEvent({ order: { id: 'MISMATCH', status: 'CONFIRMED' } })
+    );
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error.message, /inconsistent/i);
+    assert.equal(rec.transport.calls.length, 0, 'an inconsistent event must never be dispatched');
+  } finally {
+    await rec.close();
+  }
+});
+
+test("C6/INT-02: the producer's eventId and at are preserved end-to-end (not re-minted)", async () => {
+  const rec = await startSpyReceiver();
+  try {
+    // Deliberately distinct sentinel values so preservation is provable against
+    // the receiver's self-computed fallbacks (`<id>|<old>-><new>` and now()).
+    const producerEventId = 'PRODUCER-SENTINEL-XYZ';
+    const producerAt = '2020-01-02T03:04:05.678Z';
+    const res = await postEvent(
+      rec.baseUrl,
+      contractFEvent({ eventId: producerEventId, at: producerAt })
+    );
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.dispatched, true);
+    assert.equal(body.eventId, producerEventId, 'the response echoes the producer eventId');
+    assert.equal(rec.transport.calls.length, 1);
+    assert.equal(
+      rec.transport.calls[0].eventId,
+      producerEventId,
+      "the transport payload carries the producer's eventId verbatim"
+    );
+    assert.equal(
+      rec.transport.calls[0].at,
+      producerAt,
+      "the transport payload carries the producer's at verbatim"
+    );
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6/SEC-01: a transport failure yields a GENERIC 500 that never leaks transport detail', async () => {
+  // A transport that throws a message carrying sensitive infrastructure detail
+  // (host, port, filesystem path) — none of which may reach the client.
+  const secret = 'connect ECONNREFUSED 127.0.0.1:3001 /internal/secret/path';
+  const transport = {
+    send() {
+      throw new Error(secret);
+    },
+  };
+  const service = new NotificationService(transport);
+  const { server, port, host } = await start({ port: 0, host: '127.0.0.1', service });
+  const baseUrl = `http://${host}:${port}`;
+  try {
+    const res = await postEvent(baseUrl, contractFEvent());
+    assert.equal(res.status, 500, 'a transport failure is a 500');
+    const raw = await res.text();
+    const body = JSON.parse(raw);
+    assert.equal(body.error.code, 'DELIVERY_FAILED');
+    assert.equal(body.error.message, 'notification delivery failed', 'the 500 message is generic');
+    assert.ok(!raw.includes('ECONNREFUSED'), 'the raw error string must not leak');
+    assert.ok(!raw.includes('/internal/secret'), 'the filesystem path must not leak');
+    assert.ok(!raw.includes('3001'), 'the port must not leak');
+    // SEC-02 headers present on the 500 too.
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('C6/SEC-02: a successful 200 carries nosniff and no-store headers', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await postEvent(rec.baseUrl, contractFEvent());
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
   } finally {
     await rec.close();
   }

@@ -38,6 +38,15 @@ public class DiscountCalculator {
     private final CouponDiscountCalculator couponDiscountCalculator = new CouponDiscountCalculator();
 
     /**
+     * Creates a discount calculator. The instance holds only its own immutable, thread-safe
+     * {@link CouponDiscountCalculator} delegate, so it carries no mutable state and a single
+     * instance may be reused for every call.
+     */
+    public DiscountCalculator() {
+        // No initialization required: the stacking engine is created as a final field above.
+    }
+
+    /**
      * Applies the baseline fixed 10% discount to the supplied price.
      *
      * <p>This overload is retained UNCHANGED for backward compatibility: it takes a

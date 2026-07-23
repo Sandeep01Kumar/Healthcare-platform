@@ -1,0 +1,13 @@
+# robots.txt for customer-ui (order-commerce customer UI)
+#
+# Served as a static file from Vite's `public/` directory, so it takes
+# precedence over the SPA history fallback and is delivered as text/plain
+# (finding SEO-01) rather than the app's index.html.
+#
+# Per-order tracking pages (/orders/:id) are user-specific, and /coupons and
+# /orders are the order-service API prefixes proxied in dev/preview — none of
+# these should be crawled or indexed. The landing page is crawlable.
+User-agent: *
+Disallow: /orders/
+Disallow: /coupons
+Allow: /

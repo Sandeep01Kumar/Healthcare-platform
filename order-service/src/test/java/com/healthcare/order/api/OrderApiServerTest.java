@@ -73,6 +73,7 @@ public class OrderApiServerTest {
     }
 
     private OrderApiServer server;
+    private OrderService service;
     private CapturingTrigger trigger;
     private HttpClient client;
     private String baseUrl;
@@ -87,8 +88,13 @@ public class OrderApiServerTest {
                 today.minusDays(1), today.plusDays(30), Coupon.UNLIMITED_USAGE, 0));
         validator.addCoupon(new Coupon("ONCE", Coupon.TYPE_PERCENTAGE, new BigDecimal("10"),
                 today.minusDays(1), today.plusDays(30), 1, 0));
+        // A FIXED coupon whose sub-cent input (5.005) normalizes to 5.01 — used to prove that
+        // the applied-coupon metadata on the wire equals the discount actually reflected in the
+        // order total (finding BE-02).
+        validator.addCoupon(new Coupon("PENNY", Coupon.TYPE_FIXED, new BigDecimal("5.005"),
+                today.minusDays(1), today.plusDays(30), Coupon.UNLIMITED_USAGE, 0));
 
-        OrderService service = new OrderService(validator);
+        service = new OrderService(validator);
         trigger = new CapturingTrigger();
         server = new OrderApiServer(service, trigger, 0).start();
         client = HttpClient.newHttpClient();
@@ -165,6 +171,47 @@ public class OrderApiServerTest {
         assertEquals("VALIDATION", errorCode(resp.body()));
     }
 
+    /**
+     * Finding API-05: the server is authoritative for the shared coupon-code length bound. A code
+     * one character over {@link Coupon#MAX_CODE_LENGTH} must be rejected with a structured
+     * {@code 400 VALIDATION}, not accepted and answered with a misleading {@code 200 unknown code}.
+     */
+    @Test
+    void validateOverLengthCodeIsRejectedWith400() throws Exception {
+        String tooLong = "A".repeat(Coupon.MAX_CODE_LENGTH + 1);
+        HttpResponse<String> resp = post("/coupons/validate", "{\"code\":\"" + tooLong + "\"}");
+        assertEquals(400, resp.statusCode(),
+                "an over-length code must be a structured validation error, not a 200 verdict");
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
+    /**
+     * Finding API-05: a code of exactly {@link Coupon#MAX_CODE_LENGTH} characters is at the bound
+     * and must still be processed normally (here: an unknown-but-well-formed code yields a 200
+     * verdict), confirming the check rejects only codes strictly OVER the bound.
+     */
+    @Test
+    void validateMaxLengthCodeIsAccepted() throws Exception {
+        String atLimit = "A".repeat(Coupon.MAX_CODE_LENGTH);
+        HttpResponse<String> resp = post("/coupons/validate", "{\"code\":\"" + atLimit + "\"}");
+        assertEquals(200, resp.statusCode(), "a code exactly at the length bound is processed");
+        assertEquals(Boolean.FALSE, asObject(resp.body()).get("valid"));
+    }
+
+    /**
+     * Finding API-05: the shared length bound is also enforced on the order-creation path, so an
+     * over-length code submitted in {@code couponCodes} is rejected with {@code 400 VALIDATION}
+     * rather than silently dropped as unknown.
+     */
+    @Test
+    void createOrderRejectsOverLengthCouponCodeWith400() throws Exception {
+        String tooLong = "A".repeat(Coupon.MAX_CODE_LENGTH + 1);
+        HttpResponse<String> resp = post("/orders",
+                "{\"price\":\"100.00\",\"couponCodes\":[\"" + tooLong + "\"]}");
+        assertEquals(400, resp.statusCode());
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
     // ------------------------------------------------------------------ create / get / status
 
     @Test
@@ -184,6 +231,36 @@ public class OrderApiServerTest {
         assertEquals("SAVE10", c0.get("code"));
         assertEquals("PERCENTAGE", c0.get("type"));
         assertEquals("10", c0.get("value"), "applied-coupon value is a plain string on the wire");
+    }
+
+    /**
+     * Finding BE-02: for a FIXED coupon the applied-coupon metadata on the wire must equal the
+     * discount actually reflected in the order total. The PENNY coupon is defined with a sub-cent
+     * value of {@code 5.005}, which normalizes to the canonical {@code 5.01}; the order total for a
+     * price of {@code 100.00} must therefore be {@code 94.99}, and the reported coupon value must be
+     * exactly {@code 5.01} (never the raw {@code 5.005}), so metadata and applied amount agree.
+     */
+    @Test
+    void createOrderFixedCouponMetadataMatchesAppliedDiscount() throws Exception {
+        HttpResponse<String> resp = post("/orders", "{\"price\":\"100.00\",\"couponCodes\":[\"PENNY\"]}");
+        assertEquals(201, resp.statusCode());
+        Map<String, Object> order = asObject(resp.body());
+
+        BigDecimal price = (BigDecimal) order.get("price");
+        BigDecimal total = (BigDecimal) order.get("discountedTotal");
+        assertEquals(0, new BigDecimal("94.99").compareTo(total),
+                "$5.01 off 100.00 must be 94.99 on the wire");
+
+        List<?> applied = (List<?>) order.get("appliedCoupons");
+        assertEquals(1, applied.size());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> c0 = (Map<String, Object>) applied.get(0);
+        assertEquals("FIXED", c0.get("type"));
+        assertEquals("5.01", c0.get("value"),
+                "the applied-coupon metadata must be the canonical 5.01, not the raw 5.005");
+        // The reported coupon value must equal the discount reflected in the total (metadata == applied).
+        assertEquals(0, price.subtract(total).compareTo(new BigDecimal((String) c0.get("value"))),
+                "reported coupon value must equal price minus discounted total");
     }
 
     @Test
@@ -362,6 +439,99 @@ public class OrderApiServerTest {
         assertEquals("NOT_FOUND", errorCode(resp.body()));
     }
 
+    // ---- API-01: Content-Type negotiation on body-bearing routes ----------------------------
+
+    @Test
+    void postWithNonJsonContentTypeYields415() throws Exception {
+        HttpResponse<String> resp =
+                postWithContentType("/coupons/validate", "{\"code\":\"SAVE10\"}", "text/plain");
+        assertEquals(415, resp.statusCode());
+        assertEquals("UNSUPPORTED_MEDIA_TYPE", errorCode(resp.body()));
+    }
+
+    @Test
+    void postWithMissingContentTypeYields415() throws Exception {
+        HttpResponse<String> resp =
+                postWithContentType("/coupons/validate", "{\"code\":\"SAVE10\"}", null);
+        assertEquals(415, resp.statusCode());
+        assertEquals("UNSUPPORTED_MEDIA_TYPE", errorCode(resp.body()));
+    }
+
+    @Test
+    void createOrderWithNonJsonContentTypePerformsNoMutation() throws Exception {
+        // A wrong Content-Type must be rejected with 415 BEFORE any order is created (API-01).
+        int before = service.getRepository().size();
+        HttpResponse<String> resp = postWithContentType(
+                "/orders", "{\"price\":\"100.00\",\"couponCodes\":[]}", "text/plain");
+        assertEquals(415, resp.statusCode());
+        assertEquals("UNSUPPORTED_MEDIA_TYPE", errorCode(resp.body()));
+        assertEquals(before, service.getRepository().size(),
+                "a 415-rejected create must not persist an order");
+    }
+
+    @Test
+    void jsonContentTypeWithCharsetParameterIsAccepted() throws Exception {
+        // Media-type parameters such as "; charset=utf-8" must be tolerated (API-01).
+        HttpResponse<String> resp = postWithContentType(
+                "/coupons/validate", "{\"code\":\"SAVE10\"}", "application/json; charset=utf-8");
+        assertEquals(200, resp.statusCode());
+        assertEquals(Boolean.TRUE, asObject(resp.body()).get("valid"));
+    }
+
+    // ---- API-02: exact path / segment matching (no prefix over-match) -----------------------
+
+    @Test
+    void couponValidateSiblingPathYields404() throws Exception {
+        // "/coupons/validateevil" prefix-matches the "/coupons/validate" context but is NOT the
+        // real endpoint; it must be a clean 404, never processed as a validate request.
+        HttpResponse<String> resp = post("/coupons/validateevil", "{\"code\":\"SAVE10\"}");
+        assertEquals(404, resp.statusCode());
+        assertEquals("NOT_FOUND", errorCode(resp.body()));
+    }
+
+    @Test
+    void couponValidateSubPathYields404() throws Exception {
+        HttpResponse<String> resp = post("/coupons/validate/extra", "{\"code\":\"SAVE10\"}");
+        assertEquals(404, resp.statusCode());
+        assertEquals("NOT_FOUND", errorCode(resp.body()));
+    }
+
+    @Test
+    void ordersSiblingPathYields404() throws Exception {
+        // "/ordersXYZ" must NOT be misread as order id "XYZ"; it is a different route -> 404.
+        HttpResponse<String> resp = get("/ordersXYZ");
+        assertEquals(404, resp.statusCode());
+        assertEquals("NOT_FOUND", errorCode(resp.body()));
+    }
+
+    @Test
+    void ordersEmptySegmentYields404() throws Exception {
+        HttpResponse<String> resp = get("/orders//");
+        assertEquals(404, resp.statusCode());
+        assertEquals("NOT_FOUND", errorCode(resp.body()));
+    }
+
+    // ---- API-03: catch-all 404 carries the JSON envelope + CORS/security headers ------------
+
+    @Test
+    void unknownTopLevelPathYieldsJsonNotFoundWithHeaders() throws Exception {
+        HttpResponse<String> resp = get("/unknown");
+        assertEquals(404, resp.statusCode());
+        assertEquals("NOT_FOUND", errorCode(resp.body()));
+        assertTrue(resp.headers().firstValue("Content-Type").orElse("").contains("application/json"),
+                "catch-all 404 must carry a JSON content type");
+        assertEquals("nosniff", resp.headers().firstValue("X-Content-Type-Options").orElse(null));
+        assertEquals("no-store", resp.headers().firstValue("Cache-Control").orElse(null));
+        assertEquals("*", resp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+    }
+
+    @Test
+    void unknownPathPreflightReturns204WithCors() throws Exception {
+        HttpResponse<String> resp = options("/unknown");
+        assertEquals(204, resp.statusCode());
+        assertEquals("*", resp.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private HttpResponse<String> post(String path, String body) throws Exception {
@@ -371,6 +541,22 @@ public class OrderApiServerTest {
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
         return client.send(req, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /**
+     * Issues a POST with an explicit {@code Content-Type} header, or none when {@code contentType}
+     * is {@code null}. Backs the Content-Type negotiation tests (finding API-01); the default
+     * {@link #post(String, String)} always sends {@code application/json}.
+     */
+    private HttpResponse<String> postWithContentType(String path, String body, String contentType)
+            throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + path))
+                .timeout(Duration.ofSeconds(10))
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+        if (contentType != null) {
+            builder.header("Content-Type", contentType);
+        }
+        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> get(String path) throws Exception {

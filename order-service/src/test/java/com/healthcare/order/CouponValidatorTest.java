@@ -116,6 +116,84 @@ public class CouponValidatorTest {
     }
 
     /**
+     * Regression test for finding BE-01: a {@code null} coupon code must not crash the public
+     * validation APIs. The registry is a {@code ConcurrentHashMap}, whose {@code get(null)} throws
+     * {@link NullPointerException}; the validator must intercept the {@code null} before the lookup
+     * and return the documented {@link CouponValidator#REASON_UNKNOWN_CODE} invalid result instead.
+     * All three public entry points — read-only {@code validate}, redeeming {@code validateAndRedeem},
+     * and batch {@code validate(List)} — must be total (never throw) for a {@code null} code.
+     */
+    @Test
+    void nullCodeYieldsUnknownCodeInsteadOfThrowing() {
+        CouponValidator validator = seededValidator();
+
+        CouponValidator.ValidationResult single = assertDoesNotThrow(
+                () -> validator.validate((String) null),
+                "validate(null) must not throw");
+        assertNormalized(single);
+        assertFalse(single.isValid(), "a null code is not valid");
+        assertEquals(CouponValidator.REASON_UNKNOWN_CODE, single.getReason());
+        assertNull(single.getCoupon(), "a null code resolves to no coupon");
+
+        CouponValidator.ValidationResult redeemed = assertDoesNotThrow(
+                () -> validator.validateAndRedeem(null),
+                "validateAndRedeem(null) must not throw");
+        assertFalse(redeemed.isValid(), "a null code is not valid to redeem");
+        assertEquals(CouponValidator.REASON_UNKNOWN_CODE, redeemed.getReason());
+
+        // Batch validation with a null element must yield one result per input, in order, with the
+        // null element mapping to the unknown-code result rather than aborting the whole batch.
+        List<String> withNull = new ArrayList<>();
+        withNull.add("SAVE10");
+        withNull.add(null);
+        List<CouponValidator.ValidationResult> results = assertDoesNotThrow(
+                () -> validator.validate(withNull),
+                "batch validate with a null element must not throw");
+        assertEquals(2, results.size(), "one result per input code, including the null element");
+        assertTrue(results.get(0).isValid(), "the SAVE10 element still validates");
+        assertFalse(results.get(1).isValid(), "the null element is invalid");
+        assertEquals(CouponValidator.REASON_UNKNOWN_CODE, results.get(1).getReason());
+    }
+
+    /**
+     * A blank (whitespace-only) code canonicalizes to the empty string, which can never match a
+     * registered coupon; it must resolve to {@link CouponValidator#REASON_UNKNOWN_CODE} without
+     * throwing (companion to the {@code null} guard in finding BE-01).
+     */
+    @Test
+    void blankCodeYieldsUnknownCode() {
+        CouponValidator validator = seededValidator();
+        CouponValidator.ValidationResult result =
+                assertDoesNotThrow(() -> validator.validate("   "), "a blank code must not throw");
+        assertNormalized(result);
+        assertFalse(result.isValid(), "a blank code is not valid");
+        assertEquals(CouponValidator.REASON_UNKNOWN_CODE, result.getReason());
+    }
+
+    /**
+     * Regression test for finding BE-02: a {@link Coupon#TYPE_FIXED} coupon's monetary value is
+     * normalized to the two-decimal monetary scale (HALF_UP) at construction, so the value the
+     * validation result exposes is exactly the canonical amount the pricing engine subtracts.
+     * A sub-cent input such as {@code 5.005} is stored — and reported — as {@code 5.01}, never as
+     * the raw {@code 5.005} that previously diverged from the applied discount.
+     */
+    @Test
+    void fixedCouponValueIsNormalizedToTwoDecimals() {
+        LocalDate today = LocalDate.now();
+        CouponValidator validator = new CouponValidator();
+        validator.addCoupon(new Coupon("SUBCENT", Coupon.TYPE_FIXED, new BigDecimal("5.005"),
+                today.minusDays(1), today.plusDays(30), Coupon.UNLIMITED_USAGE, 0));
+
+        CouponValidator.ValidationResult result = validator.validate("SUBCENT");
+        assertNormalized(result);
+        assertTrue(result.isValid(), "SUBCENT should be accepted");
+        assertEquals(0, new BigDecimal("5.01").compareTo(result.getValue()),
+                "a FIXED value of 5.005 must normalize to 5.01");
+        assertEquals(2, result.getValue().scale(),
+                "a FIXED coupon value must be exposed at the canonical monetary scale of 2");
+    }
+
+    /**
      * Regression test for the coupon-code normalization contract (QA finding F1).
      *
      * <p>A {@link Coupon} canonicalizes its {@link Coupon#getCode() code} on construction

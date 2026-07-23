@@ -179,6 +179,16 @@ function App() {
   const mainRef = useRef(null);
   // Skip heading focus on the very first render (only focus on navigation).
   const isInitialRender = useRef(true);
+  // The order-creation "price" <input>, so keyboard focus can be RESTORED to it
+  // after a failed create (finding UI-01): the submit button is disabled while
+  // the request is in flight, which blurs focus to <body>; on failure the button
+  // re-enables but focus would otherwise be stranded, so we move it back to the
+  // price field where the user must act.
+  const priceInputRef = useRef(null);
+  // Set true when a create attempt has produced an error whose announcement
+  // should be accompanied by restoring focus to the price input. Consumed (and
+  // reset) by the focus-restoration effect once the form is interactive again.
+  const pendingCreateErrorFocus = useRef(false);
 
   // Route resolution (pure function of `path`).
   const orderId = parseOrderId(path);
@@ -221,6 +231,23 @@ function App() {
       heading.focus();
     }
   }, [routeView, orderId]);
+
+  // Restore keyboard focus to the price input after a FAILED order creation
+  // (finding UI-01). The submit button is `disabled` while `creating` is true,
+  // which moves focus to <body>; once the request settles with an error the
+  // form becomes interactive again, so we return focus to the field the user
+  // must correct. Runs only when a create error is pending and the form is no
+  // longer in flight, and clears the one-shot flag so an unrelated re-render
+  // (e.g. editing the price) does not steal focus.
+  useEffect(() => {
+    if (!creating && pendingCreateErrorFocus.current) {
+      pendingCreateErrorFocus.current = false;
+      const input = priceInputRef.current;
+      if (input && typeof input.focus === 'function') {
+        input.focus();
+      }
+    }
+  }, [creating, createFeedback]);
 
   /**
    * Navigate to an in-app path without a full page reload.
@@ -312,6 +339,9 @@ function App() {
     event.preventDefault();
     const trimmedPrice = priceDraft.trim();
     if (!trimmedPrice) {
+      // Announce the blank-price error AND restore focus to the price input so a
+      // keyboard user is taken straight to the field they must fill (UI-01).
+      pendingCreateErrorFocus.current = true;
       setCreateFeedback({ tone: 'error', message: 'Enter a price to create an order.' });
       return;
     }
@@ -329,6 +359,10 @@ function App() {
       const safe =
         (err && typeof err.userMessage === 'string' && err.userMessage) ||
         'Could not create the order. Please check the price and try again.';
+      // Restore focus to the price input once the form re-enables (UI-01) so the
+      // keyboard user is not stranded on <body> after the disabled submit button
+      // blurred them.
+      pendingCreateErrorFocus.current = true;
       setCreateFeedback({ tone: 'error', message: safe });
     } finally {
       setCreating(false);
@@ -424,14 +458,25 @@ function App() {
                   Price
                 </label>
                 <input
+                  ref={priceInputRef}
                   id="app-order-price"
                   type="text"
                   inputMode="decimal"
                   value={priceDraft}
-                  onChange={(event) => setPriceDraft(event.target.value)}
+                  onChange={(event) => {
+                    setPriceDraft(event.target.value);
+                    // Clear stale create feedback the moment the user edits the
+                    // price, so an outdated error does not linger against fresh
+                    // input (finding UI-02), mirroring the "open an order" field.
+                    if (createFeedback) {
+                      setCreateFeedback(null);
+                    }
+                  }}
                   autoComplete="off"
                   placeholder="e.g. 100.00"
                   disabled={creating}
+                  aria-describedby="app-create-feedback"
+                  aria-invalid={createIsError ? 'true' : undefined}
                   style={{
                     width: '100%',
                     minHeight: '2.75rem',
@@ -450,6 +495,7 @@ function App() {
               </button>
             </form>
             <p
+              id="app-create-feedback"
               role={createIsError ? 'alert' : 'status'}
               style={{
                 minHeight: '1.25rem',

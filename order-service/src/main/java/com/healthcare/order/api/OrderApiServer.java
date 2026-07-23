@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -105,6 +106,13 @@ public class OrderApiServer {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", requestedPort), 0);
         server.createContext("/coupons/validate", new CouponValidateHandler());
         server.createContext("/orders", new OrdersHandler());
+        // Catch-all fallback (finding API-03): the JDK server matches contexts by longest-prefix,
+        // so any request that does not fall under a declared route (e.g. "/unknown", "/coupons",
+        // "/") lands here. Without this context the server would emit the JDK's default bare-HTML
+        // 404 with NONE of the API's CORS/security headers and not the JSON error envelope. This
+        // handler answers every undeclared path with the contract error envelope plus the full
+        // header set, and honours CORS preflight.
+        server.createContext("/", new NotFoundHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
         LOGGER.log(Level.INFO, () -> "order-service API listening on http://127.0.0.1:" + getPort());
@@ -150,6 +158,17 @@ public class OrderApiServer {
                     exchange.sendResponseHeaders(204, -1);
                     return;
                 }
+                // Exact-path match (finding API-02): the context is registered at
+                // "/coupons/validate" but the JDK server matches by PREFIX, so sibling paths such
+                // as "/coupons/validateevil" and "/coupons/validate/extra" are also routed here.
+                // Only the exact route is a real endpoint; anything else is a clean 404 with NO
+                // side effect. This guard precedes the method check so an unknown route yields 404
+                // regardless of method (rather than a misleading 405).
+                String path = exchange.getRequestURI().getPath();
+                if (!"/coupons/validate".equals(path)) {
+                    sendError(exchange, 404, "NOT_FOUND", "no such route: " + path);
+                    return;
+                }
                 if (!"POST".equalsIgnoreCase(method)) {
                     sendError(exchange, 405, "METHOD_NOT_ALLOWED", "use POST /coupons/validate");
                     return;
@@ -160,14 +179,30 @@ public class OrderApiServer {
                     sendError(exchange, 400, "VALIDATION", "'code' must be a non-blank string");
                     return;
                 }
+                // Enforce the shared coupon-code length bound server-side (finding API-05): the
+                // client rejects an over-length code, but the server is authoritative and must
+                // reject it too rather than returning a misleading 200 "unknown code" verdict.
+                enforceCodeLength((String) codeValue);
                 CouponValidator.ValidationResult result = service.validateCoupon((String) codeValue);
                 sendJson(exchange, 200, couponVerdict(result));
             } catch (PayloadTooLargeException e) {
                 sendError(exchange, 413, "PAYLOAD_TOO_LARGE", e.getMessage());
+            } catch (UnsupportedMediaTypeException e) {
+                // API-01: a body-bearing request must declare application/json before we parse or
+                // act on it. Rejecting up front with 415 prevents a wrong/absent Content-Type
+                // request from performing a mutation.
+                sendError(exchange, 415, "UNSUPPORTED_MEDIA_TYPE", e.getMessage());
             } catch (JsonException | IllegalArgumentException e) {
                 sendError(exchange, 400, "VALIDATION", e.getMessage());
             } catch (RuntimeException e) {
-                LOGGER.log(Level.SEVERE, e, () -> "unexpected error in POST /coupons/validate");
+                // OBS-01: log a SANITIZED record (stable correlation id + exception TYPE only) at
+                // WARNING — never the throwable itself, whose stack trace would leak internal
+                // class/source lines and absolute filesystem paths. The full stack is routed to
+                // the FINE debug sink (disabled by default), correlatable via the same errorId.
+                String errorId = newCorrelationId();
+                LOGGER.log(Level.WARNING, () -> "unexpected error in POST /coupons/validate"
+                        + " [errorId=" + errorId + ", type=" + e.getClass().getSimpleName() + "]");
+                LOGGER.log(Level.FINE, e, () -> "stack trace for errorId=" + errorId);
                 sendError(exchange, 500, "INTERNAL", "internal error");
             } finally {
                 exchange.close();
@@ -196,14 +231,30 @@ public class OrderApiServer {
 
                 // Path after the "/orders" context: "" (create/list), "/{id}", or "/{id}/status".
                 String path = exchange.getRequestURI().getPath();
-                String remainder = path.length() > "/orders".length()
-                        ? path.substring("/orders".length())
-                        : "";
-                // Trim a single leading slash and split.
-                if (remainder.startsWith("/")) {
-                    remainder = remainder.substring(1);
+                // Exact-prefix match (finding API-02): the context is registered at "/orders" but
+                // the JDK server matches by PREFIX, so a sibling path such as "/ordersXYZ" is also
+                // routed here and MUST NOT be misread as order id "XYZ". Require the request path
+                // to be either exactly the collection root "/orders" or a well-formed sub-path
+                // "/orders/...". Anything else is a clean 404 with no side effect.
+                if (!"/orders".equals(path) && !path.startsWith("/orders/")) {
+                    sendError(exchange, 404, "NOT_FOUND", "no such route: " + path);
+                    return;
                 }
-                String[] segments = remainder.isEmpty() ? new String[0] : remainder.split("/");
+                String remainder = "/orders".equals(path)
+                        ? ""
+                        : path.substring("/orders/".length());
+                // Split KEEPING trailing empty segments (limit -1) so a stray empty segment from
+                // "/orders//" (or a trailing slash like "/orders/{id}/") is surfaced and rejected
+                // below rather than being silently normalized away.
+                String[] segments = remainder.isEmpty() ? new String[0] : remainder.split("/", -1);
+                // Reject any empty path segment (finding API-02): an empty order id such as
+                // "/orders//" is not a valid route.
+                for (String segment : segments) {
+                    if (segment.isEmpty()) {
+                        sendError(exchange, 404, "NOT_FOUND", "no such route: " + path);
+                        return;
+                    }
+                }
 
                 if (segments.length == 0) {
                     if ("POST".equalsIgnoreCase(method)) {
@@ -237,6 +288,10 @@ public class OrderApiServer {
                 sendError(exchange, 404, "NOT_FOUND", "no such route: " + path);
             } catch (PayloadTooLargeException e) {
                 sendError(exchange, 413, "PAYLOAD_TOO_LARGE", e.getMessage());
+            } catch (UnsupportedMediaTypeException e) {
+                // API-01: a body-bearing request must declare application/json before we parse or
+                // act on it (see CouponValidateHandler for the rationale).
+                sendError(exchange, 415, "UNSUPPORTED_MEDIA_TYPE", e.getMessage());
             } catch (OrderNotFoundException e) {
                 sendError(exchange, 404, "NOT_FOUND", e.getMessage());
             } catch (IllegalStateException e) {
@@ -244,7 +299,12 @@ public class OrderApiServer {
             } catch (JsonException | IllegalArgumentException e) {
                 sendError(exchange, 400, "VALIDATION", e.getMessage());
             } catch (RuntimeException e) {
-                LOGGER.log(Level.SEVERE, e, () -> "unexpected error in /orders handler");
+                // OBS-01: sanitized WARNING (correlation id + exception TYPE only) — never the
+                // throwable; full stack routed to the FINE debug sink under the same errorId.
+                String errorId = newCorrelationId();
+                LOGGER.log(Level.WARNING, () -> "unexpected error in /orders handler"
+                        + " [errorId=" + errorId + ", type=" + e.getClass().getSimpleName() + "]");
+                LOGGER.log(Level.FINE, e, () -> "stack trace for errorId=" + errorId);
                 sendError(exchange, 500, "INTERNAL", "internal error");
             } finally {
                 exchange.close();
@@ -278,6 +338,44 @@ public class OrderApiServer {
             OrderStatus next = parseStatus((String) statusValue);
             Order updated = service.updateStatus(orderId, next);
             sendJson(exchange, 200, orderView(updated));
+        }
+    }
+
+    /**
+     * Catch-all handler for any path not served by a declared route (finding API-03).
+     *
+     * <p>Registered at the root context {@code "/"}, it receives every request whose path is not
+     * matched by a longer, more specific context ({@code /coupons/validate} or {@code /orders}) —
+     * for example {@code /unknown}, {@code /coupons}, or {@code /}. It answers with the contract
+     * JSON error envelope and a {@code 404} status and, crucially, sets the same CORS and security
+     * headers ({@code X-Content-Type-Options: nosniff}, {@code Cache-Control: no-store}) as every
+     * other route via {@link #addCors(HttpExchange)}, so an unknown path yields a well-formed API
+     * response rather than the JDK's bare-HTML default {@code 404} with no headers. CORS preflight
+     * is answered with {@code 204}.</p>
+     */
+    private static final class NotFoundHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // Closed in a finally block (not try-with-resources) for the same reason as the other
+            // handlers: an error response written from a catch block must reach an open exchange.
+            try {
+                addCors(exchange);
+                if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    exchange.sendResponseHeaders(204, -1);
+                    return;
+                }
+                sendError(exchange, 404, "NOT_FOUND",
+                        "no such route: " + exchange.getRequestURI().getPath());
+            } catch (RuntimeException e) {
+                // OBS-01: sanitized WARNING + FINE-sink stack trace, correlatable by errorId.
+                String errorId = newCorrelationId();
+                LOGGER.log(Level.WARNING, () -> "unexpected error in not-found handler"
+                        + " [errorId=" + errorId + ", type=" + e.getClass().getSimpleName() + "]");
+                LOGGER.log(Level.FINE, e, () -> "stack trace for errorId=" + errorId);
+                sendError(exchange, 500, "INTERNAL", "internal error");
+            } finally {
+                exchange.close();
+            }
         }
     }
 
@@ -397,9 +495,38 @@ public class OrderApiServer {
             if (!(element instanceof String)) {
                 throw new IllegalArgumentException("'couponCodes' entries must be strings");
             }
+            // Enforce the shared coupon-code length bound server-side (finding API-05), so an
+            // over-length code submitted at order creation is rejected up front rather than
+            // silently ignored as unknown by the validator.
+            enforceCodeLength((String) element);
             codes.add((String) element);
         }
         return codes;
+    }
+
+    /**
+     * Enforces the shared, server-authoritative coupon-code length bound
+     * ({@link Coupon#MAX_CODE_LENGTH}) at the HTTP boundary (finding API-05).
+     *
+     * <p>The customer-ui rejects a code longer than the shared bound before it is ever sent;
+     * the server must apply the SAME bound so a client bypassing the UI cannot submit an
+     * over-length code and receive a misleading {@code 200 unknown code} verdict (validate) or
+     * have it silently dropped (order creation). The length is measured on the CANONICALIZED
+     * code (trimmed, upper-cased) so it matches exactly how {@link Coupon} itself bounds a
+     * code, and a {@code null}/blank canonical form is left for the caller's own non-blank
+     * check to report.</p>
+     *
+     * @param code the raw coupon code from the request
+     * @throws IllegalArgumentException if the canonicalized code exceeds
+     *                                  {@link Coupon#MAX_CODE_LENGTH} (mapped to
+     *                                  {@code 400 VALIDATION})
+     */
+    private static void enforceCodeLength(String code) {
+        String canonical = Coupon.canonicalizeCode(code);
+        if (canonical != null && canonical.length() > Coupon.MAX_CODE_LENGTH) {
+            throw new IllegalArgumentException(
+                    "'code' must not exceed " + Coupon.MAX_CODE_LENGTH + " characters");
+        }
     }
 
     private static OrderStatus parseStatus(String status) {
@@ -463,6 +590,20 @@ public class OrderApiServer {
     // ---------------------------------------------------------------------------------------
 
     /**
+     * Mints a fresh, opaque correlation id for an unexpected server error (finding OBS-01).
+     *
+     * <p>The id is logged in the sanitized {@code WARNING} record and attached to the full stack
+     * trace at the {@code FINE} sink, so an operator can correlate the two without the API ever
+     * emitting the stack (and its class/source-line and absolute-path detail) at a default-visible
+     * level.</p>
+     *
+     * @return a random UUID string
+     */
+    private static String newCorrelationId() {
+        return UUID.randomUUID().toString();
+    }
+
+    /**
      * Sets the permissive CORS headers plus baseline security headers on every response.
      *
      * <p>This method is invoked at the very start of each handler (before any response is
@@ -488,12 +629,53 @@ public class OrderApiServer {
     }
 
     private static Map<String, Object> readJsonObject(HttpExchange exchange) throws IOException {
+        // API-01: require the body-bearing request to declare application/json BEFORE the body is
+        // read or parsed, so a request with a wrong or absent Content-Type is rejected with 415
+        // and can never trigger a mutation.
+        requireJsonContentType(exchange);
         byte[] raw = readBody(exchange);
         String text = new String(raw, StandardCharsets.UTF_8).trim();
         if (text.isEmpty()) {
             throw new JsonException("request body must be a JSON object");
         }
         return Json.parseObject(text);
+    }
+
+    /**
+     * Enforces that a body-bearing request declares a JSON media type (finding API-01).
+     *
+     * <p>Invoked at the very start of {@link #readJsonObject(HttpExchange)}, before the body is
+     * read or any state is mutated. A missing {@code Content-Type} header, or one whose media
+     * type is not {@code application/json}, is rejected with {@code 415 Unsupported Media Type}
+     * so a client cannot smuggle a mutation past the API with a wrong or absent content type.
+     * Media-type parameters (for example {@code application/json; charset=utf-8}) are tolerated;
+     * only the media type itself is compared, case-insensitively.</p>
+     *
+     * @param exchange the HTTP exchange
+     * @throws UnsupportedMediaTypeException if the request does not declare {@code application/json}
+     */
+    private static void requireJsonContentType(HttpExchange exchange) {
+        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (contentType == null || !isJsonMediaType(contentType)) {
+            throw new UnsupportedMediaTypeException("Content-Type must be application/json");
+        }
+    }
+
+    /**
+     * Returns whether the given {@code Content-Type} header value has the media type
+     * {@code application/json}, ignoring any parameters (for example {@code ; charset=utf-8}) and
+     * comparing case-insensitively.
+     *
+     * @param contentType the raw {@code Content-Type} header value (never {@code null})
+     * @return {@code true} if the declared media type is {@code application/json}
+     */
+    private static boolean isJsonMediaType(String contentType) {
+        String mediaType = contentType;
+        int semicolon = mediaType.indexOf(';');
+        if (semicolon >= 0) {
+            mediaType = mediaType.substring(0, semicolon);
+        }
+        return "application/json".equalsIgnoreCase(mediaType.trim());
     }
 
     private static byte[] readBody(HttpExchange exchange) throws IOException {
@@ -538,6 +720,18 @@ public class OrderApiServer {
         private static final long serialVersionUID = 1L;
 
         PayloadTooLargeException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Signals that a body-bearing request did not declare the required {@code application/json}
+     * media type; mapped to HTTP {@code 415} (finding API-01).
+     */
+    private static final class UnsupportedMediaTypeException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        UnsupportedMediaTypeException(String message) {
             super(message);
         }
     }

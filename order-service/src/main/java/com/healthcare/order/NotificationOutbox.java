@@ -44,6 +44,15 @@ public class NotificationOutbox {
     private final ConcurrentMap<String, Entry> entries = new ConcurrentHashMap<>();
 
     /**
+     * Creates an empty outbox backed by an in-memory, thread-safe {@link ConcurrentHashMap}. No
+     * durable store is opened (persistence is out of scope for this feature), so all recorded
+     * entries live for the lifetime of the process.
+     */
+    public NotificationOutbox() {
+        // No initialization required: the backing map is created as a final field above.
+    }
+
+    /**
      * Builds the stable, correlation-friendly event id for a transition.
      *
      * @param orderId the order's id
@@ -121,6 +130,31 @@ public class NotificationOutbox {
     }
 
     /**
+     * Returns how many recorded events are still awaiting delivery ({@link State#PENDING}).
+     *
+     * <p>This is the primary delivery-health signal driving the automatic retry loop (finding
+     * INT-01): a non-zero count means at least one committed status change has not yet reached the
+     * notification transport, so a retry sweep is warranted; a zero count means the outbox is fully
+     * drained and the retry loop can relax its backoff.</p>
+     *
+     * @return the number of {@link State#PENDING} entries (never negative)
+     */
+    public long pendingCount() {
+        return entries.values().stream().filter(e -> e.state == State.PENDING).count();
+    }
+
+    /**
+     * Returns how many recorded events have been successfully delivered ({@link State#DELIVERED}).
+     * Together with {@link #pendingCount()} this exposes the outbox delivery health for diagnostics
+     * and tests (finding INT-01).
+     *
+     * @return the number of {@link State#DELIVERED} entries (never negative)
+     */
+    public long deliveredCount() {
+        return entries.values().stream().filter(e -> e.state == State.DELIVERED).count();
+    }
+
+    /**
      * An immutable-payload record of a single status-change event and its mutable delivery
      * {@link State}. The captured {@link #getOrder() order}, {@link #getFrom() from}, and
      * {@link #getTo() to} are exactly the arguments a re-delivery must replay.
@@ -143,32 +177,56 @@ public class NotificationOutbox {
             this.state = State.PENDING;
         }
 
-        /** @return the stable correlation id for this transition. */
+        /**
+         * Returns the stable correlation id for this transition.
+         *
+         * @return the stable correlation id for this transition
+         */
         public String getEventId() {
             return eventId;
         }
 
-        /** @return the order whose status changed. */
+        /**
+         * Returns the order whose status changed.
+         *
+         * @return the order whose status changed
+         */
         public Order getOrder() {
             return order;
         }
 
-        /** @return the previous status. */
+        /**
+         * Returns the previous status the order transitioned from.
+         *
+         * @return the previous status
+         */
         public OrderStatus getFrom() {
             return from;
         }
 
-        /** @return the new status. */
+        /**
+         * Returns the new status the order transitioned to.
+         *
+         * @return the new status
+         */
         public OrderStatus getTo() {
             return to;
         }
 
-        /** @return the instant this event was recorded. */
+        /**
+         * Returns the instant this event was recorded.
+         *
+         * @return the instant this event was recorded
+         */
         public Instant getRecordedAt() {
             return recordedAt;
         }
 
-        /** @return the current delivery state. */
+        /**
+         * Returns the current delivery state of this entry.
+         *
+         * @return the current delivery state
+         */
         public State getState() {
             return state;
         }

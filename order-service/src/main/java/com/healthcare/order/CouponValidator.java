@@ -294,10 +294,22 @@ public class CouponValidator {
         //    each coupon's canonical code (Coupon.getCode()), so the raw input must be
         //    canonicalized the SAME way (Coupon.canonicalizeCode) before lookup; otherwise a
         //    differently-cased or whitespace-padded code — exactly what a free-text UI field
-        //    yields — would never match its registered coupon. canonicalizeCode is
-        //    null-safe (null -> null) and a canonically-empty/unknown code simply resolves
-        //    to no coupon via registry.get(...), preserving the "unknown code" outcome.
-        Coupon coupon = registry.get(Coupon.canonicalizeCode(code));
+        //    yields — would never match its registered coupon.
+        //
+        //    NULL/EMPTY GUARD (finding BE-01): canonicalizeCode is null-safe (null -> null),
+        //    but the backing registry is a ConcurrentHashMap, whose get(null) THROWS a
+        //    NullPointerException rather than returning null (unlike a plain HashMap). A raw
+        //    null code — passed directly to this library API or arriving as a null element of
+        //    a batch — must therefore be intercepted BEFORE the map lookup and mapped to the
+        //    documented "unknown code" invalid result. A canonically-empty code (e.g. a
+        //    whitespace-only input) can never match a registered coupon either, so it is
+        //    treated identically. Guarding here keeps the public validation APIs total: they
+        //    always return a normalized ValidationResult and never throw for a null/blank code.
+        String canonicalCode = Coupon.canonicalizeCode(code);
+        if (canonicalCode == null || canonicalCode.isEmpty()) {
+            return ValidationResult.invalid(REASON_UNKNOWN_CODE);
+        }
+        Coupon coupon = registry.get(canonicalCode);
         if (coupon == null) {
             return ValidationResult.invalid(REASON_UNKNOWN_CODE);
         }

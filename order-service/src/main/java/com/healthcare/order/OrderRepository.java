@@ -27,6 +27,15 @@ public class OrderRepository {
     private final ConcurrentMap<String, Order> ordersById = new ConcurrentHashMap<>();
 
     /**
+     * Creates an empty repository backed by an in-memory, thread-safe {@link ConcurrentHashMap}.
+     * No database, ORM, or migration is opened (persistence is out of scope for this feature), so
+     * every stored order lives for the lifetime of the process.
+     */
+    public OrderRepository() {
+        // No initialization required: the backing map is created as a final field above.
+    }
+
+    /**
      * Stores (inserts or replaces) the given order under its own {@link Order#getId() id}.
      * Because {@code Order} identity is its id, saving an already-stored order simply refreshes
      * the mapping to the same logical order.

@@ -751,6 +751,13 @@ export class NotificationService {
    * @param {string} newStatus The status transitioned TO (one of
    *   `CREATED`/`CONFIRMED`/`DELIVERED`), forming a permitted transition with
    *   `oldStatus`.
+   * @param {{ eventId?: string, at?: string }} [meta] Producer correlation
+   *   metadata preserved verbatim end-to-end (INT-02). When `meta.eventId` /
+   *   `meta.at` are supplied as non-blank strings they are placed on the outgoing
+   *   payload as-is, so the identifier and timestamp minted by the upstream
+   *   producer survive the hop instead of being silently re-minted here. When
+   *   absent (e.g. a legacy three-argument caller), the service falls back to a
+   *   deterministic self-computed `eventId` and a fresh `at`. Optional.
    * @returns {Promise<SendResult>} Resolves with the dispatch outcome. When newly
    *   dispatched: `{ dispatched: true, duplicate: false, key, payload }`. When a
    *   duplicate: `{ dispatched: false, duplicate: true, key }` (no `payload`).
@@ -761,7 +768,7 @@ export class NotificationService {
    *   transport delivery fails or times out. (All rejection reasons surface as a
    *   rejected promise.)
    */
-  async sendStatusChangeNotification(order, oldStatus, newStatus) {
+  async sendStatusChangeNotification(order, oldStatus, newStatus, meta = {}) {
     validateEvent(order, oldStatus, newStatus);
     const key = NotificationService.dedupeKey(order, oldStatus, newStatus);
     if (this._processed.has(key)) {
@@ -780,13 +787,26 @@ export class NotificationService {
         `notification delivery refused: in-flight capacity of ${this._maxInFlight} reached`
       );
     }
+    // INT-02: preserve the producer's own correlation metadata verbatim when the
+    // caller supplies valid values, so the `eventId` and `at` minted upstream by
+    // the order-service producer survive end-to-end rather than being silently
+    // re-minted by this receiver. When either is absent (e.g. a legacy 3-argument
+    // caller) fall back to a deterministic, self-computed value.
+    const preservedEventId =
+      meta && typeof meta.eventId === 'string' && meta.eventId.trim() !== ''
+        ? meta.eventId
+        : NotificationService.eventId(order, oldStatus, newStatus);
+    const preservedAt =
+      meta && typeof meta.at === 'string' && meta.at.trim() !== ''
+        ? meta.at
+        : new Date().toISOString();
     /** @type {NotificationPayload} */
     const payload = {
-      eventId: NotificationService.eventId(order, oldStatus, newStatus),
+      eventId: preservedEventId,
       orderId: order.id,
       oldStatus,
       newStatus,
-      at: new Date().toISOString(),
+      at: preservedAt,
     };
     // Register the in-flight promise BEFORE the transport can run. Because
     // `_deliverWithTimeout` defers the transport invocation to a microtask, the

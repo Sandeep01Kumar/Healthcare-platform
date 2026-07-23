@@ -319,9 +319,16 @@ public class OrderService {
             trigger.onStatusChange(event.getOrder(), event.getFrom(), event.getTo());
             outbox.markDelivered(event.getEventId());
         } catch (RuntimeException ex) {
-            LOGGER.log(Level.WARNING, ex,
+            // OBS-01: log a SANITIZED record — the event id (a stable correlation handle) and the
+            // exception TYPE only, never the throwable itself, whose stack trace and message can
+            // leak internal class/source lines, downstream transport detail, and absolute
+            // filesystem paths. The full stack is routed to the FINE debug sink (disabled by
+            // default) under the same event id.
+            LOGGER.log(Level.WARNING,
                     () -> "notification delivery failed for event " + event.getEventId()
-                            + "; left PENDING for retry");
+                            + " [type=" + ex.getClass().getSimpleName() + "]; left PENDING for retry");
+            LOGGER.log(Level.FINE, ex,
+                    () -> "stack trace for failed notification event " + event.getEventId());
         }
     }
 
@@ -387,8 +394,13 @@ public class OrderService {
                 outbox.markDelivered(event.getEventId());
                 delivered++;
             } catch (RuntimeException ex) {
-                LOGGER.log(Level.WARNING, ex,
-                        () -> "retry of notification event " + event.getEventId() + " failed");
+                // OBS-01: sanitized WARNING (event id + exception type only) + FINE-sink stack
+                // trace correlatable by the same event id; never log the throwable at WARNING.
+                LOGGER.log(Level.WARNING,
+                        () -> "retry of notification event " + event.getEventId()
+                                + " failed [type=" + ex.getClass().getSimpleName() + "]");
+                LOGGER.log(Level.FINE, ex,
+                        () -> "stack trace for retry of notification event " + event.getEventId());
             }
         }
         return delivered;

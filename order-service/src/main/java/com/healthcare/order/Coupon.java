@@ -1,6 +1,7 @@
 package com.healthcare.order;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.Locale;
 import java.util.Objects;
@@ -55,6 +56,17 @@ public final class Coupon {
 
     /** Upper bound (inclusive) for a {@link #TYPE_PERCENTAGE} coupon {@link #value}. */
     private static final BigDecimal MAX_PERCENTAGE = new BigDecimal("100");
+
+    /**
+     * Monetary scale (decimal places) a {@link #TYPE_FIXED} coupon {@link #value} is
+     * normalized to. Kept in lock-step with the pricing-engine's monetary scale so the
+     * amount this validation-side model exposes is the same amount the discount engine
+     * subtracts.
+     */
+    private static final int MONEY_SCALE = 2;
+
+    /** Rounding mode used when normalizing a {@link #TYPE_FIXED} monetary {@link #value}. */
+    private static final RoundingMode MONEY_ROUNDING = RoundingMode.HALF_UP;
 
     /**
      * Maximum accepted length (in characters) of a canonicalized coupon {@link #code}. A
@@ -201,7 +213,19 @@ public final class Coupon {
         }
         this.code = normalizedCode;
         this.type = normalizedType;
-        this.value = value;
+        // A TYPE_FIXED coupon's value is a monetary amount, so normalize it to the 2-decimal
+        // monetary scale (HALF_UP) at construction — identically to the pricing-engine coupon
+        // (com.healthcare.pricing.Coupon), which subtracts a scale-2 amount. Without this, a
+        // sub-cent input such as 5.005 would be STORED here as 5.005 and echoed as the applied
+        // coupon's metadata, while the pricing engine would actually subtract the normalized
+        // 5.01 — so the reported coupon value and the discount reflected in the order total
+        // would diverge (finding BE-02). Normalizing at this shared boundary makes the metadata
+        // the single canonical amount that matches what is applied. A TYPE_PERCENTAGE value is a
+        // rate, not money, so its supplied scale is preserved (only its [0,100] range is
+        // enforced above); the pricing engine normalizes the resulting discount amount itself.
+        this.value = TYPE_FIXED.equals(normalizedType)
+                ? value.setScale(MONEY_SCALE, MONEY_ROUNDING)
+                : value;
         this.validFrom = validFrom;
         this.validUntil = validUntil;
         this.usageLimit = usageLimit;

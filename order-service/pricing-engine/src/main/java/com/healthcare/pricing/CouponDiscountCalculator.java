@@ -93,6 +93,14 @@ public class CouponDiscountCalculator {
     private static final BigDecimal ZERO_MONEY = BigDecimal.ZERO.setScale(MONEY_SCALE, ROUNDING);
 
     /**
+     * Creates a stateless coupon-discount calculator. The instance holds no mutable state, so it
+     * is immutable and thread-safe and a single instance may be shared freely across threads.
+     */
+    public CouponDiscountCalculator() {
+        // No initialization required: all configuration is expressed as immutable constants.
+    }
+
+    /**
      * Applies the given coupons to the price and returns the discounted total.
      *
      * <p>Coupons stack deterministically in the list's iteration order against a running

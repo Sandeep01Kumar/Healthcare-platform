@@ -186,3 +186,64 @@ describe('App validation + focus/title (M12)', () => {
     expect(document.activeElement.textContent).toBe('Tracking ORD-1');
   });
 });
+
+describe('App order-creation UX (UI-01 focus, UI-02 stale-clear, UI-03 aria)', () => {
+  it('UI-03: the price input is described by its feedback and not marked invalid when clean', async () => {
+    view = await renderComponent(<App />);
+    const priceInput = view.container.querySelector('#app-order-price');
+    const feedback = view.container.querySelector('#app-create-feedback');
+    expect(feedback).not.toBeNull();
+    expect(priceInput.getAttribute('aria-describedby')).toBe('app-create-feedback');
+    // No error yet, so the field must not advertise itself as invalid.
+    expect(priceInput.getAttribute('aria-invalid')).toBeNull();
+  });
+
+  it('UI-01/UI-03: a blank-price submit announces the error, marks the field invalid, and focuses it', async () => {
+    view = await renderComponent(<App />);
+    const priceInput = view.container.querySelector('#app-order-price');
+    await submitForm(priceInput.closest('form'));
+    await flush();
+
+    const feedback = view.container.querySelector('#app-create-feedback');
+    expect(feedback.getAttribute('role')).toBe('alert');
+    expect(feedback.textContent).toMatch(/enter a price/i);
+    expect(priceInput.getAttribute('aria-invalid')).toBe('true'); // UI-03
+    expect(document.activeElement).toBe(priceInput); // UI-01
+    expect(createOrder).not.toHaveBeenCalled();
+  });
+
+  it('UI-01: focus returns to the price input after a FAILED create', async () => {
+    const err = new Error('order-service POST /orders failed: 500 (raw)');
+    err.status = 500;
+    err.userMessage = 'The order service is temporarily unavailable. Please try again.';
+    createOrder.mockRejectedValue(err);
+
+    view = await renderComponent(<App />);
+    const priceInput = view.container.querySelector('#app-order-price');
+    await setInputValue(priceInput, '50');
+    await submitForm(priceInput.closest('form'));
+    await flush();
+
+    // The disabled submit button blurred focus while the request was in flight;
+    // it must be restored to the field the user has to correct.
+    expect(priceInput.getAttribute('aria-invalid')).toBe('true');
+    expect(document.activeElement).toBe(priceInput);
+    expect(window.location.pathname).toBe('/'); // stayed on landing
+  });
+
+  it('UI-02: editing the price clears stale create feedback and the invalid flag', async () => {
+    view = await renderComponent(<App />);
+    const priceInput = view.container.querySelector('#app-order-price');
+    // Produce a blank-price error first.
+    await submitForm(priceInput.closest('form'));
+    await flush();
+    const feedback = view.container.querySelector('#app-create-feedback');
+    expect(feedback.textContent).toMatch(/enter a price/i);
+
+    // Editing the price must clear the now-stale message immediately.
+    await setInputValue(priceInput, '9');
+    await flush();
+    expect(feedback.textContent).toBe('');
+    expect(priceInput.getAttribute('aria-invalid')).toBeNull();
+  });
+});

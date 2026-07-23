@@ -14,8 +14,48 @@ import { defineConfig } from 'vitest/config';
  *
  * @type {string}
  */
-const ORDER_SERVICE_PROXY_TARGET =
+const RAW_ORDER_SERVICE_PROXY_TARGET =
   process.env.ORDER_SERVICE_PROXY_TARGET || 'http://localhost:8080';
+
+/**
+ * Validates the order-service proxy target (finding CONFIG-02).
+ *
+ * The dev/preview proxy `target` MUST be an absolute `http(s)` URL. Previously
+ * the raw value was handed to `http-proxy` unvalidated, so a malformed or
+ * non-http value (an empty string, a bare host, a `file:`/`ftp:` URL, etc.)
+ * surfaced only later as an opaque `TypeError` — with an absolute-path stack
+ * trace — the instant the first request was proxied. This helper fails fast AT
+ * CONFIG LOAD with an actionable message that names the offending value, so a
+ * misconfiguration is caught before the server ever begins listening rather than
+ * as a mid-session crash.
+ *
+ * @param {string} raw - The candidate target (env override or the default).
+ * @returns {string} The validated target (returned unchanged so existing,
+ *   valid configurations behave exactly as before).
+ * @throws {Error} If `raw` is not a parseable absolute URL with an `http`/`https`
+ *   scheme.
+ */
+export function validateProxyTarget(raw) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `customer-ui: ORDER_SERVICE_PROXY_TARGET is not a valid absolute URL: ${JSON.stringify(raw)}. ` +
+        'Set it to an absolute http(s) URL, e.g. "http://localhost:8080".'
+    );
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `customer-ui: ORDER_SERVICE_PROXY_TARGET must use the http or https scheme, ` +
+        `got ${JSON.stringify(parsed.protocol)} in ${JSON.stringify(raw)}. ` +
+        'Set it to an absolute http(s) URL, e.g. "http://localhost:8080".'
+    );
+  }
+  return raw;
+}
+
+const ORDER_SERVICE_PROXY_TARGET = validateProxyTarget(RAW_ORDER_SERVICE_PROXY_TARGET);
 
 /**
  * Public base path the application is deployed under (finding M7).

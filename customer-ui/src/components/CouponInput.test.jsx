@@ -161,6 +161,45 @@ describe('CouponInput — safe error semantics (M6, M12)', () => {
   });
 });
 
+describe('CouponInput — aria-invalid and stale-feedback clearing (UI-02, UI-03)', () => {
+  it('UI-03: marks the input aria-invalid when an error is shown, and clean otherwise', async () => {
+    validateCoupon.mockResolvedValue({ valid: false, reason: 'expired' });
+    view = await renderComponent(<CouponInput appliedCoupons={[]} />);
+    const input = getInput();
+    // Clean initial state: not advertised as invalid.
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+
+    await setInputValue(input, 'OLD10');
+    await submitForm(getForm());
+    await flush();
+
+    const alert = view.container.querySelector('[role="alert"]');
+    expect(alert.textContent).toMatch(/expired/);
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    // The input is described by the same status region it announces through.
+    expect(input.getAttribute('aria-describedby')).toBe(
+      alert.getAttribute('id')
+    );
+  });
+
+  it('UI-02: editing the code clears the stale error and the invalid flag', async () => {
+    validateCoupon.mockResolvedValue({ valid: false, reason: 'expired' });
+    view = await renderComponent(<CouponInput appliedCoupons={[]} />);
+    const input = getInput();
+    await setInputValue(input, 'OLD10');
+    await submitForm(getForm());
+    await flush();
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+
+    // Editing the code must clear the now-stale feedback immediately.
+    await setInputValue(input, 'OLD11');
+    await flush();
+    const status = view.container.querySelector('#' + input.getAttribute('aria-describedby'));
+    expect(status.textContent).toBe('');
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+  });
+});
+
 describe('CouponInput — touch targets and removal (M12, C3)', () => {
   it('sizes the Apply control to the touch-target minimum', async () => {
     view = await renderComponent(<CouponInput appliedCoupons={[]} />);

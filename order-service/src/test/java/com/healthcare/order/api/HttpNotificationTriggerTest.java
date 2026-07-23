@@ -135,6 +135,43 @@ public class HttpNotificationTriggerTest {
                 () -> trigger.onStatusChange(order, OrderStatus.CREATED, OrderStatus.CONFIRMED));
     }
 
+    // ------------------------------------------------------------------ CONFIG-01: fail-fast URL
+
+    @Test
+    void relativeReceiverUrlIsRejectedAtConstruction() {
+        // A bare relative reference (no scheme/authority) is a valid URI to URI.create but can
+        // never be delivered to; it must fail fast at construction, not later at send time.
+        assertThrows(IllegalArgumentException.class,
+                () -> new HttpNotificationTrigger("relative-notification-path"));
+    }
+
+    @Test
+    void schemeRelativeReceiverUrlIsRejectedAtConstruction() {
+        // "//host/path" has an authority but no scheme -> not absolute -> rejected.
+        assertThrows(IllegalArgumentException.class,
+                () -> new HttpNotificationTrigger("//127.0.0.1:3001/notifications"));
+    }
+
+    @Test
+    void nonHttpSchemeReceiverUrlIsRejectedAtConstruction() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new HttpNotificationTrigger("ftp://127.0.0.1:3001/notifications"));
+    }
+
+    @Test
+    void hostlessReceiverUrlIsRejectedAtConstruction() {
+        // Absolute with an http scheme but no host authority (e.g. "http:///notifications").
+        assertThrows(IllegalArgumentException.class,
+                () -> new HttpNotificationTrigger("http:///notifications"));
+    }
+
+    @Test
+    void validAbsoluteHttpUrlIsAccepted() {
+        // The positive case: a well-formed absolute http(s) URL constructs without throwing.
+        assertDoesNotThrow(() -> new HttpNotificationTrigger("http://127.0.0.1:3001/notifications"));
+        assertDoesNotThrow(() -> new HttpNotificationTrigger("https://example.test/notifications"));
+    }
+
     // ------------------------------------------------------------------ stand-in receiver
 
     /**

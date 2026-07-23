@@ -301,10 +301,19 @@ export default function CouponInput({
             id={inputId}
             type="text"
             value={code}
-            onChange={(event) => setCode(event.target.value)}
+            onChange={(event) => {
+              setCode(event.target.value);
+              // Clear stale feedback the moment the user edits the code, so an
+              // outdated message (a prior error or an "already applied" notice)
+              // does not linger against fresh input (finding UI-02).
+              if (feedback) {
+                setFeedback(null);
+              }
+            }}
             disabled={submitting}
             autoComplete="off"
             aria-describedby={statusId}
+            aria-invalid={isError ? 'true' : undefined}
             style={{
               width: '100%',
               minHeight: '2.75rem', // >= 44px touch target (finding M12)

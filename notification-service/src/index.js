@@ -77,11 +77,22 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
+    let overflowed = false;
     req.on('data', (chunk) => {
+      // API-04: once the cap is exceeded, stop buffering but KEEP DRAINING the
+      // socket (rather than destroying the request stream) so the handler can
+      // still write a clean, deterministic 413 JSON response and close the
+      // connection gracefully. Tearing the stream down here (the previous
+      // `req.destroy()`) raced the response and surfaced to the client as a
+      // connection reset instead of a 413 — the exact defect this guards against.
+      if (overflowed) {
+        return;
+      }
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
+        overflowed = true;
+        chunks.length = 0;
         reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -97,40 +108,99 @@ function readBody(req) {
  * @param {import('node:http').ServerResponse} res The response.
  * @param {number} status The HTTP status code.
  * @param {object} body The JSON-serializable body.
+ * @param {Record<string, string>} [extraHeaders] Additional response headers to
+ *   merge in (e.g. `{ Connection: 'close' }` on a 413). Applied last so a caller
+ *   can add — but not silently drop — the standard headers below.
  * @returns {void}
  */
-function sendJson(res, status, body) {
+function sendJson(res, status, body, extraHeaders) {
   const text = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(text),
+    // SEC-02: defense-in-depth headers on EVERY JSON response so neither a client
+    // nor an intermediary can MIME-sniff the body into an executable type or cache
+    // a per-request notification result.
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+    ...(extraHeaders || {}),
   });
   res.end(text);
 }
 
 /**
- * Maps a contract-F status-change event onto the arguments of
- * {@link NotificationService#sendStatusChangeNotification}.
+ * Strictly parses and validates a contract-F status-change event off the wire,
+ * enforcing a single, immutable event schema (INT-02).
  *
- * The order identity is taken from `event.order.id` when present, else
- * `event.orderId`; the order's `status` is set to `newStatus` so the event passes
- * the service's internal-consistency check (a present `order.status` must equal
- * the transition target).
+ * Unlike the previous lenient mapping, this parser:
+ *  - requires a non-blank top-level `orderId`, `oldStatus` and `newStatus`;
+ *  - when a nested `order` object is present, requires its `id` (when it carries
+ *    one) to AGREE with the top-level `orderId` — a receiver must never silently
+ *    pick one identity over a conflicting other;
+ *  - passes the producer's `order.status` THROUGH unchanged (rather than forcing
+ *    it to `newStatus`), so the service's internal-consistency guard actually
+ *    fires on an inconsistent event instead of being masked; and
+ *  - extracts the producer's own `eventId`/`at` correlation metadata so
+ *    {@link NotificationService#sendStatusChangeNotification} can preserve them
+ *    verbatim end-to-end.
  *
- * @param {object} event The parsed request body.
- * @returns {{ order: { id: unknown, status: unknown }, oldStatus: unknown, newStatus: unknown }}
+ * @param {unknown} event The parsed JSON request body.
+ * @returns {{ order: { id: string, status?: unknown }, oldStatus: string,
+ *   newStatus: string, meta: { eventId?: string, at?: string } }} The normalized
+ *   arguments plus preserved producer metadata.
+ * @throws {TypeError} If `event` is not an object or a required field is missing
+ *   or of the wrong type.
+ * @throws {RangeError} If a present nested `order.id` disagrees with `orderId`.
  */
-function mapEvent(event) {
-  const nested = event && typeof event === 'object' ? event.order : undefined;
-  const id =
-    nested && typeof nested === 'object' && typeof nested.id === 'string'
-      ? nested.id
-      : event?.orderId;
+function parseEvent(event) {
+  if (event === null || typeof event !== 'object' || Array.isArray(event)) {
+    throw new TypeError('event must be a JSON object');
+  }
+  const { orderId, oldStatus, newStatus, eventId, at, order: nested } = event;
+  if (typeof orderId !== 'string' || orderId.trim() === '') {
+    throw new TypeError('event.orderId must be a non-blank string');
+  }
+  if (typeof oldStatus !== 'string' || oldStatus.trim() === '') {
+    throw new TypeError('event.oldStatus must be a non-blank string');
+  }
+  if (typeof newStatus !== 'string' || newStatus.trim() === '') {
+    throw new TypeError('event.newStatus must be a non-blank string');
+  }
+  /** @type {{ id: string, status?: unknown }} */
+  const order = { id: orderId };
+  if (nested !== undefined) {
+    if (nested === null || typeof nested !== 'object' || Array.isArray(nested)) {
+      throw new TypeError('event.order must be an object when present');
+    }
+    if (nested.id !== undefined && nested.id !== orderId) {
+      throw new RangeError('event.order.id is inconsistent with event.orderId');
+    }
+    // Pass the producer status THROUGH; the service's guard enforces == newStatus.
+    if (nested.status !== undefined) {
+      order.status = nested.status;
+    }
+  }
   return {
-    order: { id, status: event?.newStatus },
-    oldStatus: event?.oldStatus,
-    newStatus: event?.newStatus,
+    order,
+    oldStatus,
+    newStatus,
+    meta: {
+      eventId: typeof eventId === 'string' && eventId.trim() !== '' ? eventId : undefined,
+      at: typeof at === 'string' && at.trim() !== '' ? at : undefined,
+    },
   };
+}
+
+/**
+ * Returns whether a request `Content-Type` header denotes a JSON body —
+ * `application/json`, matched case-insensitively and ignoring any `; charset=...`
+ * parameters (API-01).
+ *
+ * @param {string | undefined} contentType The raw `Content-Type` header value.
+ * @returns {boolean} `true` when the media type is `application/json`.
+ */
+function isJsonContentType(contentType) {
+  return String(contentType || '').split(';')[0].trim().toLowerCase() === 'application/json';
 }
 
 /**
@@ -162,11 +232,20 @@ export function createReceiver(service = notificationService) {
     const path = (req.url || '').split('?')[0];
 
     if (path !== NOTIFICATIONS_PATH) {
-      sendJson(res, 404, { error: { message: `no such route: ${path}` } });
+      sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `no such route: ${path}` } });
       return;
     }
     if (req.method !== 'POST') {
-      sendJson(res, 405, { error: { message: 'use POST /notifications' } });
+      sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'use POST /notifications' } });
+      return;
+    }
+    // API-01: require a JSON media type BEFORE reading or parsing the body, so a
+    // mislabelled (e.g. text/plain) or unlabelled payload is refused up front with
+    // 415 and never reaches the parser or the service.
+    if (!isJsonContentType(req.headers['content-type'])) {
+      sendJson(res, 415, {
+        error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Content-Type must be application/json' },
+      });
       return;
     }
 
@@ -178,16 +257,29 @@ export function createReceiver(service = notificationService) {
       }
       event = JSON.parse(raw);
     } catch (err) {
-      const status = err && err.statusCode === 413 ? 413 : 400;
-      sendJson(res, status, {
-        error: { message: status === 413 ? 'request body too large' : 'invalid JSON body' },
-      });
+      if (err && err.statusCode === 413) {
+        // API-04: the body was capped by readBody, which kept draining rather than
+        // destroying the socket. Drain any remainder and answer with a
+        // deterministic 413 JSON, closing the connection cleanly (Connection:
+        // close) instead of resetting it.
+        req.resume();
+        sendJson(
+          res,
+          413,
+          { error: { code: 'PAYLOAD_TOO_LARGE', message: 'request body too large' } },
+          { Connection: 'close' }
+        );
+        return;
+      }
+      sendJson(res, 400, { error: { code: 'INVALID_JSON', message: 'invalid JSON body' } });
       return;
     }
 
-    const { order, oldStatus, newStatus } = mapEvent(event);
     try {
-      const result = await service.sendStatusChangeNotification(order, oldStatus, newStatus);
+      // INT-02: strictly parse the event (one immutable schema) and carry the
+      // producer's eventId/at through unchanged.
+      const { order, oldStatus, newStatus, meta } = parseEvent(event);
+      const result = await service.sendStatusChangeNotification(order, oldStatus, newStatus, meta);
       sendJson(res, 200, {
         dispatched: result.dispatched,
         duplicate: result.duplicate,
@@ -195,11 +287,18 @@ export function createReceiver(service = notificationService) {
         eventId: result.payload ? result.payload.eventId : NotificationService.eventId(order, oldStatus, newStatus),
       });
     } catch (err) {
-      // A validation failure (bad event) is a client error; anything else is a
-      // transport/delivery failure the producer may retry.
+      // A validation failure (a bad event) is a client error carrying a safe,
+      // descriptive message. Anything else is a transport/delivery failure whose
+      // detail (host, path, cause) must NOT leak to the caller (SEC-01): answer
+      // with a generic 500 envelope.
       const isValidation = err instanceof TypeError || err instanceof RangeError;
-      const status = isValidation ? 400 : 500;
-      sendJson(res, status, { error: { message: String(err && err.message ? err.message : err) } });
+      if (isValidation) {
+        sendJson(res, 400, { error: { code: 'INVALID_EVENT', message: String(err.message) } });
+      } else {
+        sendJson(res, 500, {
+          error: { code: 'DELIVERY_FAILED', message: 'notification delivery failed' },
+        });
+      }
     }
   });
 }

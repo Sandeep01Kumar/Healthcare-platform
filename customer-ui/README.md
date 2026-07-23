@@ -127,9 +127,11 @@ fallback (e.g. nginx `try_files $uri /index.html`) so deep links like
 
 ## Tech & scripts
 
-Built with React 19 and Vite 6 on Node 22.x. Dependency versions are pinned
+Built with React 19 and Vite 6 on Node 22.x. Runtime dependencies are pinned
 exactly (`react`/`react-dom` `19.2.8`, `vite` `6.4.3`, `@vitejs/plugin-react`
-`4.7.0`, `vitest` `2.1.9`, `jsdom`) for reproducible installs.
+`4.7.0`); the dev-only test toolchain tracks a patched major line (`vitest`
+`^4.1.10`, `jsdom` `^29.1.1`), with the resolved versions recorded in
+`package-lock.json` for reproducible installs.
 
 - `npm run dev` — start the Vite dev server.
 - `npm run build` — production build to `dist/`.

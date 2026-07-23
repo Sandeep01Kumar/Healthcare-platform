@@ -247,6 +247,91 @@ public class OrderApiServerTest {
         assertTrue(resp.headers().firstValue("Access-Control-Allow-Methods").isPresent());
     }
 
+    /**
+     * Security headers (finding SEC-3/SEC-4): every response must carry
+     * {@code X-Content-Type-Options: nosniff} and {@code Cache-Control: no-store}. They are set in
+     * {@code addCors()}, which runs first in every handler, so they appear on both success and
+     * error responses.
+     */
+    @Test
+    void responsesCarrySecurityHeaders() throws Exception {
+        String id = (String) asObject(post("/orders", "{\"price\":\"10.00\",\"couponCodes\":[]}").body()).get("id");
+        HttpResponse<String> resp = get("/orders/" + id);
+        assertEquals(200, resp.statusCode());
+        assertEquals("nosniff",
+                resp.headers().firstValue("X-Content-Type-Options").orElse(null),
+                "dynamic responses must disable MIME sniffing");
+        assertEquals("no-store",
+                resp.headers().firstValue("Cache-Control").orElse(null),
+                "dynamic per-order responses must not be cached");
+
+        // Also present on an error response (404).
+        HttpResponse<String> missing = get("/orders/does-not-exist");
+        assertEquals(404, missing.statusCode());
+        assertEquals("nosniff", missing.headers().firstValue("X-Content-Type-Options").orElse(null));
+        assertEquals("no-store", missing.headers().firstValue("Cache-Control").orElse(null));
+    }
+
+    /**
+     * DoS guard (finding SEC-1): a tiny body carrying an astronomical scientific-notation price
+     * must be rejected with a clean {@code 400}, never expanded (which previously produced a
+     * multi-megabyte response / timeout / OOM-class memory growth).
+     */
+    @Test
+    void astronomicalPriceYields400() throws Exception {
+        HttpResponse<String> resp = post("/orders", "{\"price\":\"1e10000000\",\"couponCodes\":[]}");
+        assertEquals(400, resp.statusCode(), "absurd-magnitude price must be rejected, not expanded");
+        assertEquals("VALIDATION", errorCode(resp.body()));
+        // The response is the small error envelope, not a materialized giant number.
+        assertTrue(resp.body().length() < 1024, "error response must be small, not an expansion");
+    }
+
+    /** DoS guard (finding SEC-1): a huge negative exponent (enormous positive scale) is rejected. */
+    @Test
+    void astronomicalFractionalPriceYields400() throws Exception {
+        HttpResponse<String> resp = post("/orders", "{\"price\":\"1e-10000000\",\"couponCodes\":[]}");
+        assertEquals(400, resp.statusCode());
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
+    /** Validation (finding SEC-1): a negative order price is rejected with a clean {@code 400}. */
+    @Test
+    void negativePriceYields400() throws Exception {
+        HttpResponse<String> resp = post("/orders", "{\"price\":\"-5.00\",\"couponCodes\":[]}");
+        assertEquals(400, resp.statusCode());
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
+    /** Validation (finding SEC-1): an over-precise price (too many significant digits) is rejected. */
+    @Test
+    void excessivePrecisionPriceYields400() throws Exception {
+        HttpResponse<String> resp = post("/orders",
+                "{\"price\":\"123456789012345678901234567890\",\"couponCodes\":[]}");
+        assertEquals(400, resp.statusCode());
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
+    /** Validation (finding SEC-1): a price above the maximum allowed amount is rejected. */
+    @Test
+    void overMaxPriceYields400() throws Exception {
+        HttpResponse<String> resp = post("/orders",
+                "{\"price\":\"1000000000001\",\"couponCodes\":[]}");
+        assertEquals(400, resp.statusCode());
+        assertEquals("VALIDATION", errorCode(resp.body()));
+    }
+
+    /**
+     * Regression (finding SEC-1): the price bounds must NOT reject legitimate large orders. A price
+     * within {@code MAX_PRICE} with a few decimals is accepted and priced normally.
+     */
+    @Test
+    void largeButValidPriceIsAccepted() throws Exception {
+        HttpResponse<String> resp = post("/orders", "{\"price\":\"1000000.50\",\"couponCodes\":[]}");
+        assertEquals(201, resp.statusCode(), "a realistic large price must still be accepted");
+        Map<String, Object> order = asObject(resp.body());
+        assertEquals(0, new BigDecimal("1000000.50").compareTo((BigDecimal) order.get("price")));
+    }
+
     @Test
     void oversizedBodyYields413() throws Exception {
         String big = "{\"code\":\"" + "A".repeat(OrderApiServer.MAX_BODY_BYTES + 100) + "\"}";

@@ -186,4 +186,45 @@ public class JsonTest {
         assertEquals("PERCENTAGE", c0.get("type"));
         assertEquals("10", c0.get("value"));
     }
+
+    // ------------------------------------------------------------------ nesting-depth guard (SEC-2)
+
+    /**
+     * Security regression (finding SEC-2, CWE-674): a pathologically deep document must raise the
+     * codec's own {@link JsonException} — which the HTTP layer maps to a clean {@code 400} — rather
+     * than recursing until the thread stack overflows. A {@link StackOverflowError} is a
+     * {@link Error} (not a {@link RuntimeException}), so it would escape both the codec and the
+     * handlers' catch blocks; if this test ever caught one, {@code assertThrows(JsonException.class,
+     * ...)} would fail because the error would not match and would propagate out.
+     */
+    @Test
+    void parseDeeplyNestedArrayThrowsJsonExceptionNotStackOverflow() {
+        String deep = "[".repeat(16_000);
+        assertThrows(JsonException.class, () -> Json.parse(deep));
+    }
+
+    /** Companion to the array case: deeply nested objects are guarded identically. */
+    @Test
+    void parseDeeplyNestedObjectThrowsJsonException() {
+        String deep = "{\"a\":".repeat(16_000);
+        assertThrows(JsonException.class, () -> Json.parse(deep));
+    }
+
+    /**
+     * Regression guard for finding SEC-2: the depth cap must not break legitimately nested input.
+     * A properly-balanced structure well within the limit parses successfully, and the shared depth
+     * counter is correctly unwound between top-level parses (a second deep-but-legal parse still
+     * succeeds).
+     */
+    @Test
+    void parseLegitimatelyNestedStructureStillParses() {
+        int depth = 40; // comfortably under the internal cap
+        String balanced = "[".repeat(depth) + "]".repeat(depth);
+        Object first = Json.parse(balanced);
+        assertTrue(first instanceof List<?>, "balanced nested arrays parse to nested lists");
+
+        // Depth is per-parse state that must reset; a second call of the same depth still works.
+        Object second = Json.parse(balanced);
+        assertTrue(second instanceof List<?>, "the depth counter must reset between parses");
+    }
 }

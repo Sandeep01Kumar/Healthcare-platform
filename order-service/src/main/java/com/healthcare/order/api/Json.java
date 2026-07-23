@@ -183,8 +183,19 @@ public final class Json {
     /** Strict recursive-descent parser over a fixed input string. */
     private static final class Parser {
 
+        /**
+         * Maximum object/array nesting depth accepted by the parser. The order-service wire
+         * contract exchanges only shallow objects and arrays (the deepest legitimate shape is a
+         * few levels), so this cap never rejects a real document; it exists solely to reject
+         * pathologically-nested input that would otherwise recurse until the thread stack
+         * overflows. See {@link #readValue()}.
+         */
+        private static final int MAX_DEPTH = 64;
+
         private final String src;
         private int pos;
+        /** Current object/array nesting depth; bounded by {@link #MAX_DEPTH}. */
+        private int depth;
 
         Parser(String src) {
             this.src = src;
@@ -209,20 +220,34 @@ public final class Json {
             if (atEnd()) {
                 throw new JsonException("Unexpected end of input");
             }
-            char c = src.charAt(pos);
-            return switch (c) {
-                case '{' -> readObject();
-                case '[' -> readArray();
-                case '"' -> readString();
-                case 't', 'f' -> readBoolean();
-                case 'n' -> readNull();
-                default -> {
-                    if (c == '-' || (c >= '0' && c <= '9')) {
-                        yield readNumber();
+            // Guard against uncontrolled recursion on deeply-nested input (CWE-674). Without this,
+            // a tiny body such as 16 000 nested '[' characters drives this method (mutually
+            // recursive with readObject/readArray) until the thread stack overflows. A
+            // StackOverflowError is a java.lang.Error, so it bypasses the handlers' RuntimeException
+            // catch blocks, terminating the worker with an empty reply (a non-contract response)
+            // plus thread churn and stack-trace log amplification. Throwing a JsonException before
+            // recursing turns the vector into the standard 400 error envelope on every endpoint.
+            if (++depth > MAX_DEPTH) {
+                throw new JsonException("maximum nesting depth exceeded (" + MAX_DEPTH + ")");
+            }
+            try {
+                char c = src.charAt(pos);
+                return switch (c) {
+                    case '{' -> readObject();
+                    case '[' -> readArray();
+                    case '"' -> readString();
+                    case 't', 'f' -> readBoolean();
+                    case 'n' -> readNull();
+                    default -> {
+                        if (c == '-' || (c >= '0' && c <= '9')) {
+                            yield readNumber();
+                        }
+                        throw new JsonException("Unexpected character '" + c + "' at index " + pos);
                     }
-                    throw new JsonException("Unexpected character '" + c + "' at index " + pos);
-                }
-            };
+                };
+            } finally {
+                depth--;
+            }
         }
 
         private Map<String, Object> readObject() {

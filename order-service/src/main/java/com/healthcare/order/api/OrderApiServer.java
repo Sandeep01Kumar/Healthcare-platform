@@ -285,21 +285,101 @@ public class OrderApiServer {
     // Request parsing helpers
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * The maximum accepted order price. Generous enough for any realistic order (a trillion) while
+     * bounding the magnitude an attacker can submit.
+     */
+    static final BigDecimal MAX_PRICE = new BigDecimal("1000000000000");
+
+    /**
+     * The maximum accepted fractional scale for a price. Allows sub-cent precision for legitimate
+     * inputs while rejecting the enormous positive scales that scientific-notation inputs like
+     * {@code 1e-10000000} would otherwise carry.
+     */
+    static final int MAX_PRICE_SCALE = 8;
+
+    /**
+     * The maximum accepted number of significant digits in a price.
+     */
+    static final int MAX_PRICE_PRECISION = 20;
+
+    /**
+     * Reads and validates the {@code price} field into a bounded {@link BigDecimal}.
+     *
+     * <p>Both the parsed-number branch (a bare JSON number arriving as a {@link BigDecimal}) and
+     * the numeric-string branch flow through {@link #validatePrice(BigDecimal)}, so the bounds are
+     * enforced regardless of how the client encodes the value.</p>
+     *
+     * @param priceValue the raw {@code price} value from the request body
+     * @return the validated, bounded price
+     * @throws IllegalArgumentException if the value is missing, the wrong type, unparseable, or
+     *                                  outside the accepted magnitude/precision/scale/sign bounds
+     *                                  (mapped to a {@code 400 VALIDATION} response)
+     */
     private static BigDecimal readPrice(Object priceValue) {
         if (priceValue == null) {
             throw new IllegalArgumentException("'price' is required");
         }
         if (priceValue instanceof BigDecimal bd) {
-            return bd;
+            return validatePrice(bd);
         }
         if (priceValue instanceof String s) {
+            BigDecimal parsed;
             try {
-                return new BigDecimal(s.trim());
+                parsed = new BigDecimal(s.trim());
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException("'price' is not a valid number: " + s);
             }
+            return validatePrice(parsed);
         }
         throw new IllegalArgumentException("'price' must be a number or numeric string");
+    }
+
+    /**
+     * Enforces sane numeric bounds on a price to prevent both nonsensical values and a
+     * denial-of-service via unbounded {@link BigDecimal} expansion.
+     *
+     * <p>A tiny request body such as {@code {"price":"1e10000000"}} parses cheaply into a
+     * {@link BigDecimal} whose <em>scale</em> is {@code -10000000}; later rendering it with
+     * {@link BigDecimal#toPlainString()} (in the JSON serializer) or performing arithmetic on it
+     * would attempt to materialize a ten-million-digit number, exhausting CPU and heap. The scale
+     * check below rejects such inputs immediately using only the stored {@code scale} field — no
+     * expansion ever occurs. The remaining checks impose ordinary business bounds.</p>
+     *
+     * <p>Checks are ordered cheapest-and-most-protective first:</p>
+     * <ol>
+     *   <li><b>scale</b> — a negative scale means an exponent inflated the integer part (e.g.
+     *       {@code 1e10000000}); a scale above {@link #MAX_PRICE_SCALE} means an exponent inflated
+     *       the fractional part. Both are rejected before any digit materialization.</li>
+     *   <li><b>precision</b> — reject absurd significant-digit counts (e.g. a 10 000-digit
+     *       integer literal under the 16 KB body cap).</li>
+     *   <li><b>sign</b> — a negative order price is nonsensical.</li>
+     *   <li><b>magnitude</b> — reject values above {@link #MAX_PRICE}.</li>
+     * </ol>
+     *
+     * @param price the parsed price
+     * @return the same price, unchanged, if it is within bounds
+     * @throws IllegalArgumentException if any bound is violated
+     */
+    private static BigDecimal validatePrice(BigDecimal price) {
+        int scale = price.scale();
+        if (scale < 0 || scale > MAX_PRICE_SCALE) {
+            throw new IllegalArgumentException(
+                    "'price' has an unsupported scale; provide a plain decimal with at most "
+                            + MAX_PRICE_SCALE + " fractional digits");
+        }
+        if (price.precision() > MAX_PRICE_PRECISION) {
+            throw new IllegalArgumentException(
+                    "'price' has too many significant digits (max " + MAX_PRICE_PRECISION + ")");
+        }
+        if (price.signum() < 0) {
+            throw new IllegalArgumentException("'price' must not be negative");
+        }
+        if (price.compareTo(MAX_PRICE) > 0) {
+            throw new IllegalArgumentException(
+                    "'price' exceeds the maximum allowed amount of " + MAX_PRICE.toPlainString());
+        }
+        return price;
     }
 
     private static List<String> readCouponCodes(Object codesValue) {
@@ -382,10 +462,29 @@ public class OrderApiServer {
     // Transport helpers
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * Sets the permissive CORS headers plus baseline security headers on every response.
+     *
+     * <p>This method is invoked at the very start of each handler (before any response is
+     * committed), so the headers it sets appear on <em>all</em> responses — preflight
+     * {@code 204}s, success bodies, and every error envelope.</p>
+     *
+     * <p>Two defense-in-depth security headers are set here in addition to CORS:</p>
+     * <ul>
+     *   <li>{@code X-Content-Type-Options: nosniff} — instructs browsers not to MIME-sniff the
+     *       response body away from its declared {@code Content-Type} (all responses are
+     *       {@code application/json}), closing content-sniffing attack vectors.</li>
+     *   <li>{@code Cache-Control: no-store} — every response on this API is dynamic, per-order
+     *       state; {@code no-store} prevents shared/browser caches from retaining order data.</li>
+     * </ul>
+     */
     private static void addCors(HttpExchange exchange) {
         exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
         exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
+        // Security hardening (defense-in-depth): prevent MIME sniffing and caching of dynamic data.
+        exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
     }
 
     private static Map<String, Object> readJsonObject(HttpExchange exchange) throws IOException {

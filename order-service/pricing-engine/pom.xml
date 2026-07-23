@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Pricing Engine — Maven build descriptor
+  ~
+  ~ This is the FOUNDATIONAL module in the multi-module build order:
+  ~     pricing-engine  ->  order-service  ->  healthcare-platform
+  ~
+  ~ It must be installable into the local Maven repository (`mvn install`)
+  ~ BEFORE `order-service` builds, because `order-service/pom.xml` declares a
+  ~ dependency on this module's published artifact. The three published
+  ~ coordinates below (groupId / artifactId / version) are a hard contract with
+  ~ that downstream module and MUST NOT be changed in isolation.
+  ~
+  ~ Responsibility of this module: coupon-aware, multi-coupon discount
+  ~ calculation for the order-commerce "Coupon and Order Tracking" feature.
+  ~ It has NO server, persistence, or inter-module dependencies — it is a plain,
+  ~ self-contained library jar with unit tests.
+  ~
+  ~ SOURCE LAYOUT (standard Maven):
+  ~   Production sources live under src/main/java in the named package
+  ~   `com.healthcare.pricing` (Coupon, DiscountCalculator, and the later
+  ~   CouponDiscountCalculator). A named package is REQUIRED here: the
+  ~   discount-side `com.healthcare.pricing.Coupon` published in this artifact
+  ~   must coexist on the downstream order-service classpath with the distinct
+  ~   validation-side `com.healthcare.order.Coupon`. Package-less (default-package)
+  ~   classes would collide by binary name across the two modules, so both
+  ~   modules are namespaced. Tests live under src/test/java in the DEFAULT (unnamed)
+  ~   package and reference the production types through explicit imports of
+  ~   `com.healthcare.pricing.*` (an unnamed-package type may legally import from a
+  ~   named package).
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      ~ Published coordinates (HARD CONTRACT with order-service/pom.xml).
+      ~ order-service depends on EXACTLY:
+      ~     com.healthcare : pricing-engine : 1.0.0
+      ~ Any change here breaks the downstream order-service build.
+      -->
+    <groupId>com.healthcare</groupId>
+    <artifactId>pricing-engine</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Pricing Engine</name>
+    <description>
+        Coupon-aware discount calculation library for the order-commerce platform.
+        Computes single- and multi-coupon (stacked) discounts and supersedes the
+        legacy fixed 10% reduction. Foundational module consumed by order-service.
+    </description>
+
+    <properties>
+        <!--
+          ~ Compile against the Java 21 LTS release. Using `maven.compiler.release`
+          ~ (rather than separate source/target) guarantees the compiler also
+          ~ validates that only Java 21 platform APIs are referenced.
+          -->
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <!-- Force UTF-8 for source (and resource/report) encoding for reproducibility. -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!--
+          ~ Centralized, pinned versions. JUnit is pinned to 5.11.4 (the exact
+          ~ 5.11.x patch available/verified in the offline local repository).
+          ~ Plugin versions are pinned so the build is deterministic and does not
+          ~ depend on Maven's built-in default plugin versions.
+          -->
+        <junit.jupiter.version>5.11.4</junit.jupiter.version>
+        <maven.compiler.plugin.version>3.14.1</maven.compiler.plugin.version>
+        <maven.surefire.plugin.version>3.5.6</maven.surefire.plugin.version>
+    </properties>
+
+    <!--
+      ~ Dependencies — MINIMAL by design. This is the root of the module
+      ~ dependency order, so it must NOT depend on order-service,
+      ~ notification-service, customer-ui, or any other repository module, and
+      ~ it pulls in NO Spring / HTTP / persistence / JDBC libraries.
+      ~
+      ~ JUnit 5 (Jupiter) is the ONLY dependency and is confined to `test` scope,
+      ~ so it never leaks onto the runtime/compile classpath of consumers. The
+      ~ `junit-jupiter` aggregator transitively provides the API, params, and
+      ~ engine artifacts needed to author and execute the mandated discount tests.
+      -->
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              ~ Compiler: Java 21 release. Standard Maven layout is used, so the
+              ~ default source roots (src/main/java, src/test/java) are compiled;
+              ~ no source-directory override or include filter is needed.
+              -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.compiler.plugin.version}</version>
+            </plugin>
+
+            <!--
+              ~ Surefire: runs the JUnit 5 (JUnit Platform) tests under
+              ~ src/test/java during `mvn test`. Default configuration is fully
+              ~ non-interactive and requires no JUnit 4 provider; the JUnit
+              ~ Platform provider is auto-selected from the junit-jupiter engine
+              ~ on the test classpath.
+              -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven.surefire.plugin.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

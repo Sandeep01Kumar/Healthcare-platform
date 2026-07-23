@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+  order-service — Maven build (Coupon & Order Tracking feature)
+  ============================================================================
+  Build/test tooling for the order-service Java module. It hosts the mandated
+  JUnit 5 tests (OrderServiceTest, CouponValidatorTest, and the api-package
+  JsonTest, OrderApiServerTest, HttpNotificationTriggerTest) and produces a
+  runnable JAR of the order domain + HTTP API classes.
+
+  HTTP STACK / RUNTIME DEPENDENCIES (deliberately zero third-party runtime deps):
+    The HTTP API and the Java->Node notification bridge are built entirely on the
+    JDK, so this module adds NO Jackson/Gson/Spring/Netty runtime dependency:
+      - inbound HTTP server: com.sun.net.httpserver.HttpServer (JDK, jdk.httpserver)
+      - outbound HTTP client: java.net.http.HttpClient (JDK, java.net.http)
+      - JSON read/write:      com.healthcare.order.api.Json (hand-rolled, in-module)
+    This keeps the module buildable and runnable fully OFFLINE (the environment has
+    no network/registry access) and avoids pulling a web framework in for what is a
+    small, well-defined wire contract. The only compile/runtime dependency is the
+    sibling pricing-engine artifact; JUnit is test-scoped.
+
+  RUN (local, offline):
+    The entry point is com.healthcare.order.api.OrderServiceApplication (declared as
+    the JAR Main-Class below). It starts the HTTP API and wires an
+    HttpNotificationTrigger to the notification-service receiver. Because java -jar
+    ignores -cp, launch with an explicit classpath that also contains the
+    pricing-engine jar, e.g.:
+
+      PE=$(find ~/.m2/repository -name pricing-engine-1.0.0.jar | head -1)
+      java -cp "target/order-service-1.0.0.jar:$PE" \
+           com.healthcare.order.api.OrderServiceApplication
+
+    Environment overrides (both optional):
+      ORDER_SERVICE_PORT  (default 8080)   TCP port the API binds on 127.0.0.1
+      NOTIFICATION_URL    (default http://127.0.0.1:3001/notifications)
+                          the notification-service receiver the trigger POSTs to
+
+  CROSS-MODULE COORDINATION (must stay consistent with the pricing-engine pom):
+    groupId = com.healthcare, version = 1.0.0
+      - this module            -> artifactId = order-service
+      - the pricing-engine one -> artifactId = pricing-engine
+    Build order is pricing-engine -> order-service: the pricing-engine artifact
+    (com.healthcare:pricing-engine:1.0.0) MUST be `mvn install`-ed into the
+    local repository BEFORE this module is built, because OrderService references
+    the pricing-engine discount types on the compile classpath.
+
+  SOURCE LAYOUT (standard Maven):
+    Main Java sources live under src/main/java in the named package
+    `com.healthcare.order` (OrderService, OrderStatus, Coupon, and the later
+    Order, CouponValidator). Named packages are REQUIRED: the validation-side
+    `com.healthcare.order.Coupon` compiled here must coexist on the classpath
+    with the DISTINCT discount-side `com.healthcare.pricing.Coupon` pulled in
+    from the pricing-engine dependency. Package-less (default-package) classes
+    would collide by binary name across the two jars, so both modules are
+    namespaced. Tests live under src/test/java (Maven default) in the same
+    package and are picked up as TEST sources.
+
+  OFFLINE VERSION PINS:
+    Plugin/dependency versions are pinned to the artifacts already present in the
+    local Maven repository so the build succeeds fully offline.
+  ============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Module coordinates: EXACTLY com.healthcare:order-service:1.0.0 -->
+    <groupId>com.healthcare</groupId>
+    <artifactId>order-service</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Order Service</name>
+    <description>
+        Order lifecycle service: coupon validation API, order status handling
+        (CREATED -> CONFIRMED -> DELIVERED), and orchestration of the
+        pricing-engine coupon discount and status-change notifications.
+    </description>
+
+    <properties>
+        <!-- Java 21 (LTS) compile target/runtime via the compiler plugin. -->
+        <maven.compiler.release>21</maven.compiler.release>
+        <!-- Deterministic, platform-independent source encoding. -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Centralized, offline-present version pins (see header note). -->
+        <pricing-engine.version>1.0.0</pricing-engine.version>
+        <junit.jupiter.version>5.11.4</junit.jupiter.version>
+        <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
+        <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
+        <!-- Core packaging plugin; used only to stamp the runnable Main-Class. -->
+        <maven-jar-plugin.version>3.1.2</maven-jar-plugin.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            Inter-module dependency on the pricing-engine artifact. OrderService
+            references the discount types via their qualified package
+            `com.healthcare.pricing`. Honors the AAP build order: pricing-engine
+            must be installed to the local repo first. Because both modules are
+            namespaced, the discount-side `com.healthcare.pricing.Coupon` and the
+            validation-side `com.healthcare.order.Coupon` coexist on this module's
+            classpath with no binary-name collision.
+        -->
+        <dependency>
+            <groupId>com.healthcare</groupId>
+            <artifactId>pricing-engine</artifactId>
+            <version>${pricing-engine.version}</version>
+        </dependency>
+
+        <!--
+            JUnit 5 (Jupiter) aggregator — test scope only. Pulls in the Jupiter
+            API, engine, and params modules for authoring and running the
+            order-service status-transition and coupon-validation tests.
+        -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                maven-compiler-plugin: standard Maven layout, so the default
+                source roots (src/main/java, src/test/java) are compiled. Java
+                release level is taken from the maven.compiler.release property
+                above. No source-directory override or include filter is needed;
+                the nested pricing-engine/ directory is a SEPARATE module and is
+                not under this module's src/main/java, so it is never swept into
+                this compilation.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+            </plugin>
+
+            <!--
+                maven-surefire-plugin: runs the JUnit 5 tests under src/test/java
+                non-interactively during the `test` phase (JUnit Platform provider).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+            </plugin>
+
+            <!--
+                maven-jar-plugin: core packaging plugin (offline-present). Its only
+                role here is to stamp the runnable entry point into the JAR manifest
+                (Main-Class: com.healthcare.order.api.OrderServiceApplication) so the
+                produced artifact is self-describing. The classpath is supplied at
+                launch time (see the RUN note in the header) rather than embedded,
+                because the sibling pricing-engine jar lives in the local Maven repo,
+                not alongside this jar — so no addClasspath/Class-Path is set.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>${maven-jar-plugin.version}</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.healthcare.order.api.OrderServiceApplication</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

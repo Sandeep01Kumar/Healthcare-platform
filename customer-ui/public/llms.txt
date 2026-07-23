@@ -1,0 +1,28 @@
+# customer-ui
+
+> The customer-facing single-page application for the order-commerce platform.
+> It lets a customer apply one or more coupon codes and track an order's status
+> through the lifecycle CREATED -> CONFIRMED -> DELIVERED. All coupon-validity
+> and order-status verdicts are server-authoritative: the UI renders results
+> from the order-service HTTP API and makes no such decisions of its own.
+
+## Application
+
+- The app is built with React 19 and Vite 6. It has no client-side router
+  library; routing is implemented with the browser History API.
+- Routes: `/` (apply coupons and create or open an order) and `/orders/:id`
+  (order tracking with a CREATED -> CONFIRMED -> DELIVERED status stepper).
+
+## Order-service API (proxied same-origin in dev/preview)
+
+- `POST /coupons/validate` — validate a single coupon code; body `{ code }`.
+- `POST /orders` — create an order; body `{ price, couponCodes }`; returns the
+  created order (including its id and status).
+- `GET /orders/{id}` — retrieve an order's current status.
+- `POST /orders/{id}/status` — advance an order to its next lifecycle status.
+
+## Notes
+
+- This file and `robots.txt` are static metadata served from Vite's `public/`
+  directory; metadata requests are answered with the real static file rather
+  than the SPA's `index.html` fallback.

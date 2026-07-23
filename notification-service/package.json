@@ -1,0 +1,21 @@
+{
+  "name": "notification-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP receiver that consumes order-service status-change events (POST /notifications) and sends a notification whenever an order's status changes.",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "MIT",
+  "keywords": [
+    "notification",
+    "order-status",
+    "http-receiver"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/index.js"
+  }
+}

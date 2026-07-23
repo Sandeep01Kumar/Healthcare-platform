@@ -25,6 +25,7 @@
 
 import { useId, useState } from 'react';
 import { validateCoupon } from '../api/orderServiceClient.js';
+import { canonicalizeCouponCode } from '../api/orderServiceContract.js';
 
 /**
  * Render the opaque `discount` metadata for display without ever throwing.
@@ -82,28 +83,50 @@ function toneColor(tone) {
 }
 
 /**
- * Coupon input with multi-coupon management.
+ * Coupon input with multi-coupon management (controlled component).
  *
- * Works fully without any props (`<CouponInput />`), as rendered by
- * `App.jsx`. An optional callback notifies a parent whenever the applied-coupon
- * list changes (after a successful apply or a removal).
+ * The applied-coupon list is OWNED BY THE PARENT and supplied via
+ * `appliedCoupons`; this component never stores that list locally, so the
+ * coupons the customer applies are lifted up to `App`, which forwards them to
+ * order creation so they actually participate in pricing and redemption
+ * (findings C3/M4). The component still owns purely local UI state — the
+ * text-field value, the transient feedback message, and the in-flight flag —
+ * and delegates every applied-list mutation to the parent through
+ * `onApplyCoupon`/`onRemoveCoupon`. Because the parent performs the actual list
+ * update (with a functional update), there is no stale-closure hazard when
+ * several applies happen in succession (finding M4).
+ *
+ * Coupon identity is CASE-INSENSITIVE after trimming: codes are compared and
+ * stored in their canonical (trimmed, upper-cased) form via
+ * {@link module:orderServiceContract.canonicalizeCouponCode}, matching the
+ * order-service, so `save10` and `SAVE10` are recognized as the same coupon and
+ * never stack (findings M4/C4).
  *
  * Validity is server-authoritative: the component branches solely on
  * `result.valid` from {@link validateCoupon} and never computes validity
- * locally. Transport/HTTP failures are caught and surfaced as feedback without
- * marking any coupon valid.
+ * locally. Transport/HTTP failures are caught and surfaced as feedback using the
+ * error's SAFE `userMessage` (never raw lower-layer text such as method, path,
+ * status, or the server envelope), without marking any coupon valid (finding M6).
  *
- * @param {object} [props] - Component props (all optional).
- * @param {(appliedCoupons: Array<{code: string, discount: object, reason: string}>) => void} [props.onAppliedChange]
- *   Invoked with the new applied-coupon list after every change (apply or
- *   remove). Defaults to a no-op so prop-less usage is fully functional.
+ * @param {object} [props] - Component props.
+ * @param {Array<{code: string, discount: object, reason: string}>} [props.appliedCoupons]
+ *   The applied coupons owned by the parent; each entry's `code` is canonical.
+ *   Defaults to an empty list.
+ * @param {(entry: {code: string, discount: object, reason: string}) => void} [props.onApplyCoupon]
+ *   Invoked with the newly applied coupon (canonical `code`) after the server
+ *   accepts it; the parent appends it. Defaults to a no-op.
+ * @param {(canonicalCode: string) => void} [props.onRemoveCoupon]
+ *   Invoked with the canonical code to remove; the parent removes it. Defaults
+ *   to a no-op.
  * @returns {JSX.Element} The coupon input UI.
  */
-export default function CouponInput({ onAppliedChange = () => {} } = {}) {
-  // Current text-field value (controlled input).
+export default function CouponInput({
+  appliedCoupons = [],
+  onApplyCoupon = () => {},
+  onRemoveCoupon = () => {},
+} = {}) {
+  // Current text-field value (controlled input) — local UI state only.
   const [code, setCode] = useState('');
-  // Server-valid coupons currently applied; each entry: { code, discount, reason }.
-  const [applied, setApplied] = useState([]);
   // Last verdict/error to announce: { tone: 'error'|'success'|'info', message } | null.
   const [feedback, setFeedback] = useState(null);
   // True while a validation request is in flight (disables the form).
@@ -119,11 +142,12 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
   /**
    * Validate and apply the entered coupon.
    *
-   * Server-authoritative: only a `result.valid === true` verdict adds the
-   * coupon to the applied list. Empty/whitespace-only input and duplicates are
-   * short-circuited as input hygiene (not validity decisions). The request is
-   * guarded by `submitting` and wrapped in try/catch/finally so transport
-   * errors never mark a coupon valid.
+   * Server-authoritative: only a `result.valid === true` verdict is applied
+   * (handed to the parent via `onApplyCoupon`). Empty/whitespace-only input and
+   * duplicates — compared by CANONICAL identity against the parent's
+   * `appliedCoupons` — are short-circuited as input hygiene (not validity
+   * decisions). The request is guarded by `submitting` and wrapped in
+   * try/catch/finally so transport errors never mark a coupon valid.
    *
    * @param {import('react').FormEvent<HTMLFormElement>} event - The submit event.
    * @returns {Promise<void>}
@@ -136,31 +160,37 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
       setFeedback({ tone: 'info', message: 'Enter a coupon code.' });
       return;
     }
-    if (applied.some((entry) => entry.code === trimmed)) {
+    const canonical = canonicalizeCouponCode(trimmed);
+    if (
+      appliedCoupons.some(
+        (entry) => canonicalizeCouponCode(entry.code) === canonical
+      )
+    ) {
       setFeedback({ tone: 'info', message: `Coupon "${trimmed}" is already applied.` });
       return;
     }
 
     setSubmitting(true);
     try {
-      // The server is the sole authority on validity; we relay and reflect.
-      const result = await validateCoupon(trimmed);
+      // The server is the sole authority on validity; we relay the canonical
+      // code (matching how the server redeems it) and reflect the verdict.
+      const result = await validateCoupon(canonical);
       if (result && result.valid) {
-        const entry = { code: trimmed, discount: result.discount, reason: result.reason };
-        // Functional update keeps the list correct under React batching.
-        setApplied((prev) => [...prev, entry]);
-        // Submits are serialized (the form is disabled while submitting), so the
-        // `applied` closure is the current list; notify the parent with the new one.
-        onAppliedChange([...applied, entry]);
+        const entry = { code: canonical, discount: result.discount, reason: result.reason };
+        // The parent owns the list and appends with a functional update, so
+        // there is no stale-closure hazard here (finding M4).
+        onApplyCoupon(entry);
         setCode('');
         const discountText = formatDiscount(result.discount);
         setFeedback({
           tone: 'success',
           message: discountText
-            ? `Coupon "${trimmed}" applied — discount: ${discountText}.`
-            : `Coupon "${trimmed}" applied.`,
+            ? `Coupon "${canonical}" applied — discount: ${discountText}.`
+            : `Coupon "${canonical}" applied.`,
         });
       } else {
+        // `result.reason` is the server's normalized, user-facing validity
+        // reason (e.g. "expired") — safe to show, unlike an exception message.
         const reason = result && result.reason ? result.reason : 'not valid';
         setFeedback({
           tone: 'error',
@@ -168,58 +198,97 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
         });
       }
     } catch (err) {
-      // Transport/HTTP failure — surface it without marking the coupon valid.
-      // Extract the message defensively: a thrown value is usually an Error but
-      // is not guaranteed to be one.
-      const detail = err instanceof Error ? err.message : String(err);
-      setFeedback({
-        tone: 'error',
-        message: `Could not validate coupon. Please try again. (${detail})`,
-      });
+      // Transport/HTTP failure — surface the SAFE user message only (finding
+      // M6). The client attaches a curated `userMessage`; never render the raw
+      // `err.message`, which may carry method/path/status/server-envelope
+      // diagnostics intended for logs.
+      const safe =
+        (err && typeof err.userMessage === 'string' && err.userMessage) ||
+        'Could not validate the coupon. Please try again.';
+      setFeedback({ tone: 'error', message: safe });
     } finally {
       setSubmitting(false);
     }
   }
 
   /**
-   * Remove a previously applied coupon by its code.
+   * Remove a previously applied coupon by its canonical code, delegating the
+   * actual list mutation to the parent.
    *
-   * @param {string} couponCode - The code of the coupon to remove.
+   * @param {string} couponCode - The canonical code of the coupon to remove.
    * @returns {void}
    */
   function handleRemove(couponCode) {
-    // Functional update, then notify the parent with the resulting list.
-    setApplied((prev) => prev.filter((entry) => entry.code !== couponCode));
-    onAppliedChange(applied.filter((entry) => entry.code !== couponCode));
+    onRemoveCoupon(couponCode);
     setFeedback({ tone: 'info', message: `Coupon "${couponCode}" removed.` });
   }
 
+  // Errors are announced assertively (role="alert"); all other tones use the
+  // polite role="status". A single live-region mechanism (the role) governs the
+  // announcement — no redundant explicit `aria-live` (finding M12/N2 style).
+  const isError = feedback?.tone === 'error';
+
   return (
-    <section aria-label="Coupons" style={{ maxWidth: 480 }}>
-      <form onSubmit={handleSubmit} noValidate>
-        <label htmlFor={inputId} style={{ display: 'block', marginBottom: 4 }}>
-          Coupon code
-        </label>
-        <input
-          id={inputId}
-          type="text"
-          value={code}
-          onChange={(event) => setCode(event.target.value)}
+    <section aria-label="Coupons" style={{ width: '100%', maxWidth: 480 }}>
+      {/*
+        Responsive form row: the field and button sit side by side on wide
+        screens and WRAP onto separate lines on narrow/mobile screens
+        (flexWrap). The field grows/shrinks with a sensible basis and
+        `minWidth: 0` so it never forces horizontal overflow (finding M12).
+      */}
+      <form
+        onSubmit={handleSubmit}
+        noValidate
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'flex-end',
+          gap: '0.5rem',
+        }}
+      >
+        <div style={{ flex: '1 1 12rem', minWidth: 0 }}>
+          <label htmlFor={inputId} style={{ display: 'block', marginBottom: 4 }}>
+            Coupon code
+          </label>
+          <input
+            id={inputId}
+            type="text"
+            value={code}
+            onChange={(event) => setCode(event.target.value)}
+            disabled={submitting}
+            autoComplete="off"
+            aria-describedby={statusId}
+            style={{
+              width: '100%',
+              minHeight: '2.75rem', // >= 44px touch target (finding M12)
+              padding: '0.5rem 0.625rem',
+              fontSize: '1rem',
+              boxSizing: 'border-box',
+            }}
+          />
+        </div>
+        <button
+          type="submit"
           disabled={submitting}
-          autoComplete="off"
-          aria-describedby={statusId}
-          style={{ marginInlineEnd: 8 }}
-        />
-        <button type="submit" disabled={submitting}>
+          style={{
+            minHeight: '2.75rem', // >= 44px touch target (finding M12)
+            padding: '0.5rem 1rem',
+            fontSize: '1rem',
+          }}
+        >
           {submitting ? 'Applying…' : 'Apply'}
         </button>
       </form>
 
       <p
         id={statusId}
-        role="status"
-        aria-live="polite"
-        style={{ minHeight: '1.25rem', margin: '0.5rem 0', color: toneColor(feedback?.tone) }}
+        role={isError ? 'alert' : 'status'}
+        style={{
+          minHeight: '1.25rem',
+          margin: '0.5rem 0',
+          color: toneColor(feedback?.tone),
+          overflowWrap: 'anywhere',
+        }}
       >
         {feedback ? feedback.message : ''}
       </p>
@@ -227,11 +296,11 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
       <p id={appliedLabelId} style={{ margin: '0.5rem 0 0.25rem', fontWeight: 600 }}>
         Applied coupons
       </p>
-      {applied.length === 0 ? (
+      {appliedCoupons.length === 0 ? (
         <p style={{ margin: 0, color: '#666666' }}>No coupons applied yet.</p>
       ) : (
         <ul aria-labelledby={appliedLabelId} style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-          {applied.map((entry) => {
+          {appliedCoupons.map((entry) => {
             const discountText = formatDiscount(entry.discount);
             return (
               <li
@@ -240,10 +309,12 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: '0.5rem',
                   padding: '4px 0',
                 }}
               >
-                <span>
+                <span style={{ overflowWrap: 'anywhere', minWidth: 0 }}>
                   <strong>{entry.code}</strong>
                   {discountText ? ` — ${discountText}` : ''}
                 </span>
@@ -251,6 +322,7 @@ export default function CouponInput({ onAppliedChange = () => {} } = {}) {
                   type="button"
                   onClick={() => handleRemove(entry.code)}
                   aria-label={`Remove coupon ${entry.code}`}
+                  style={{ minHeight: '2.75rem', padding: '0.375rem 0.75rem' }}
                 >
                   Remove
                 </button>

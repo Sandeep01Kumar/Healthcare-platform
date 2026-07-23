@@ -180,6 +180,7 @@ const HEADER_STYLE = {
  */
 const STEPPER_STYLE = {
   display: 'flex',
+  flexWrap: 'wrap', // steps wrap onto new rows on narrow screens (finding M12)
   alignItems: 'stretch',
   gap: '0.5rem',
   listStyle: 'none',
@@ -193,7 +194,10 @@ const STEPPER_STYLE = {
  * @constant {React.CSSProperties}
  */
 const STEP_BASE_STYLE = {
-  flex: '1 1 0',
+  // A non-zero basis lets steps sit in a row on wide screens yet wrap to full
+  // width (rather than being crushed) on narrow screens (finding M12).
+  flex: '1 1 8rem',
+  minWidth: 0,
   display: 'flex',
   alignItems: 'center',
   gap: '0.5rem',
@@ -237,35 +241,118 @@ const STEP_STATE_STYLES = Object.freeze({
  * @constant {React.CSSProperties}
  */
 const STEP_DOT_STYLE = {
-  display: 'inline-block',
-  width: '0.5rem',
-  height: '0.5rem',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  width: '1.1rem',
+  height: '1.1rem',
   borderRadius: '50%',
   flexShrink: 0,
+  fontSize: '0.8rem',
+  fontWeight: 700,
+  lineHeight: 1,
+};
+
+/**
+ * Shape-based marker glyph per stepper state. This is the NON-COLOR cue required
+ * by WCAG 1.4.1 (finding M12): the three states are distinguished by glyph SHAPE
+ * (`✓` filled check, `●` filled circle, `○` hollow circle), not by color alone,
+ * so the stepper remains legible to color-blind users. The glyph is decorative
+ * (`aria-hidden`); the accessible state is carried by `aria-current="step"` and
+ * the visually-hidden {@link STEP_STATE_SR_LABEL} text.
+ *
+ * @constant {Record<'complete'|'current'|'upcoming', string>}
+ */
+const STEP_STATE_GLYPH = Object.freeze({
+  complete: '\u2713', // ✓
+  current: '\u25CF', // ●
+  upcoming: '\u25CB', // ○
+});
+
+/**
+ * Visually-hidden state words announced to assistive technology so the stepper's
+ * meaning does not depend on the visual glyph/color. The `current` stage relies
+ * on `aria-current="step"` instead, so its entry is intentionally empty to avoid
+ * a duplicated announcement.
+ *
+ * @constant {Record<'complete'|'current'|'upcoming', string>}
+ */
+const STEP_STATE_SR_LABEL = Object.freeze({
+  complete: 'completed',
+  current: '',
+  upcoming: 'upcoming',
+});
+
+/**
+ * Visually-hidden ("screen-reader only") style: removed from the visual layout
+ * but still present in the accessibility tree. The standard 1px clip technique.
+ *
+ * @constant {React.CSSProperties}
+ */
+const SR_ONLY_STYLE = {
+  position: 'absolute',
+  width: '1px',
+  height: '1px',
+  padding: 0,
+  margin: '-1px',
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
+};
+
+/**
+ * Inline style for the small "Refresh"/"Retry" control shown on the tracking
+ * page. Sized to meet the >= 44px touch-target guideline (finding M12).
+ *
+ * @constant {React.CSSProperties}
+ */
+const REFRESH_BUTTON_STYLE = {
+  minHeight: '2.75rem',
+  padding: '0.5rem 1rem',
+  fontSize: '0.95rem',
 };
 
 /**
  * Render the order tracking page for a single order.
  *
- * On mount, and whenever `orderId` changes, the component fetches the order via
- * {@link getOrder} inside a cancellation-safe {@link useEffect} and drives three
- * pieces of state: `loading` (a request is in flight), `error` (a message string
- * when the fetch fails), and `order` (the fetched order view). A stale request
- * whose `orderId` has since changed -- or whose component has unmounted -- never
- * commits its result, avoiding a React "state update on an unmounted component"
- * warning and out-of-order responses.
+ * On mount, whenever `orderId` changes, and whenever the customer triggers a
+ * manual refresh/retry, the component fetches the order via {@link getOrder}
+ * inside a cancellation-safe {@link useEffect} and drives three pieces of state:
+ * `loading` (a request is in flight), `error` (a SAFE message string when the
+ * fetch fails), and `order` (the fetched order view). Each run:
+ * - clears the previously displayed `order` at the START of the run so stale
+ *   data from a different id (for example the status badge) is never shown while
+ *   the new order loads (finding M5);
+ * - passes an {@link AbortController} signal to {@link getOrder} and aborts it in
+ *   the effect cleanup, so a superseded request (id change, refresh, or unmount)
+ *   is actually cancelled at the transport layer rather than merely ignored
+ *   (finding M5); the guarded `active` flag additionally prevents any state
+ *   update from a stale run.
+ *
+ * A manual refresh is available via a monotonically increasing `reloadToken`
+ * that is part of the effect's dependency list; a "Refresh" control (when an
+ * order is loaded) and a "Retry" control (on failure) increment it to re-run the
+ * fetch (finding M5).
  *
  * Rendering is fully guarded and never dereferences a null order:
  * - while loading, a `role="status"` message is announced;
- * - on failure, a `role="alert"` message reports the error;
+ * - on failure, a `role="alert"` message reports the SAFE error text (the
+ *   client's `userMessage`, never raw transport/HTTP detail — finding M6) with a
+ *   Retry control;
  * - when no order resolves, a `role="status"` empty fallback is shown;
  * - on success, an ordered `<ol>` status stepper renders the {@link LIFECYCLE}
  *   stages, marking the stage that matches the fetched `order.status` with
- *   `aria-current="step"` (an unknown status highlights nothing), and the
+ *   `aria-current="step"` (an unknown status highlights nothing), with a
+ *   shape-based non-color state glyph and a visually-hidden state word, and the
  *   current-status label is shown via {@link OrderStatusBadge}.
  *
  * The displayed stage is derived exclusively from the server-provided
  * `order.status`; this component never computes or advances status locally.
+ *
+ * The page owns the SINGLE page-level `<h1>` (finding M12); it is programmatically
+ * focusable (`tabIndex={-1}`) so the router in `App.jsx` can move focus to it on
+ * navigation.
  *
  * @param {object} props - Component props.
  * @param {string} props.orderId - The identifier of the order to track (the
@@ -277,14 +364,20 @@ export default function OrderTrackingPage({ orderId }) {
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Bumped by the Refresh/Retry controls to re-run the fetch effect (finding M5).
+  const [reloadToken, setReloadToken] = useState(0);
   const headingId = useId();
 
   useEffect(() => {
     let active = true;
 
+    // Clear any previously displayed order at the start of EVERY run so stale
+    // data (e.g. the header status badge) is never shown while a different order
+    // loads (finding M5).
+    setOrder(null);
+
     // Guard against a missing id: report it rather than issuing a bad request.
     if (!orderId) {
-      setOrder(null);
       setError('No order id was provided.');
       setLoading(false);
       return () => {
@@ -296,22 +389,34 @@ export default function OrderTrackingPage({ orderId }) {
     setLoading(true);
     setError(null);
 
+    // Cancel the in-flight request when this run is superseded (id change,
+    // refresh, or unmount) so the transport is actually aborted (finding M5).
+    const controller =
+      typeof AbortController !== 'undefined' ? new AbortController() : null;
+
     /**
      * Fetch the order and commit the result only if this effect run is still
-     * active (i.e. not superseded by an `orderId` change or an unmount).
+     * active (i.e. not superseded by an `orderId`/`reloadToken` change or an
+     * unmount).
      *
      * @returns {Promise<void>} Resolves once the relevant state has been set.
      */
     async function loadOrder() {
       try {
-        const data = await getOrder(orderId);
+        const data = await getOrder(orderId, { signal: controller?.signal });
         if (active) {
           setOrder(data);
         }
       } catch (err) {
+        // A cancellation is expected on supersede/unmount — never surface it.
         if (active) {
           setOrder(null);
-          setError(err?.message || 'Failed to load order');
+          // Show only the SAFE, curated message (finding M6); the raw
+          // `err.message` may carry method/path/status/server-envelope text.
+          setError(
+            (err && typeof err.userMessage === 'string' && err.userMessage) ||
+              'Could not load the order. Please try again.'
+          );
         }
       } finally {
         if (active) {
@@ -324,8 +429,19 @@ export default function OrderTrackingPage({ orderId }) {
 
     return () => {
       active = false;
+      controller?.abort();
     };
-  }, [orderId]);
+  }, [orderId, reloadToken]);
+
+  /**
+   * Trigger a manual refresh/retry by advancing the reload token, which re-runs
+   * the fetch effect (and aborts any in-flight request first).
+   *
+   * @returns {void}
+   */
+  function refresh() {
+    setReloadToken((token) => token + 1);
+  }
 
   // Derived, null-safe view data (never dereference a null order).
   const current = order ? stageIndex(order.status) : -1;
@@ -339,21 +455,49 @@ export default function OrderTrackingPage({ orderId }) {
   return (
     <section aria-labelledby={headingId} style={CONTAINER_STYLE}>
       <div style={HEADER_STYLE}>
-        <h1 id={headingId} style={{ margin: 0, fontSize: '1.5rem' }}>
+        {/*
+          The SINGLE page-level heading (finding M12). `tabIndex={-1}` makes it
+          programmatically focusable so the router can move focus here on
+          navigation without adding it to the sequential tab order.
+        */}
+        <h1
+          id={headingId}
+          tabIndex={-1}
+          style={{ margin: 0, fontSize: '1.5rem' }}
+        >
           Order tracking
         </h1>
-        {order ? <OrderStatusBadge status={order.status} /> : null}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          {order ? <OrderStatusBadge status={order.status} /> : null}
+          {order ? (
+            <button
+              type="button"
+              onClick={refresh}
+              disabled={loading}
+              style={REFRESH_BUTTON_STYLE}
+            >
+              {loading ? 'Refreshing…' : 'Refresh'}
+            </button>
+          ) : null}
+        </div>
       </div>
-      <p style={{ margin: '0.25rem 0 0', color: '#6b7280' }}>
+      <p style={{ margin: '0.25rem 0 0', color: '#6b7280', overflowWrap: 'anywhere' }}>
         Tracking order: {orderId || '\u2014'}
       </p>
 
       {loading ? (
         <p role="status">Loading order&hellip;</p>
       ) : error ? (
-        <p role="alert" style={{ color: '#b91c1c' }}>
-          {orderId ? `Could not load order ${orderId}: ${error}` : error}
-        </p>
+        <div>
+          <p role="alert" style={{ color: '#b91c1c', overflowWrap: 'anywhere' }}>
+            {error}
+          </p>
+          {orderId ? (
+            <button type="button" onClick={refresh} style={REFRESH_BUTTON_STYLE}>
+              Retry
+            </button>
+          ) : null}
+        </div>
       ) : !order ? (
         <p role="status">
           {orderId ? `No order found for ${orderId}.` : 'No order found.'}
@@ -365,17 +509,31 @@ export default function OrderTrackingPage({ orderId }) {
               const state = stepState(index, current);
               const isCurrent = state === 'current';
               const variant = STEP_STATE_STYLES[state];
+              const srLabel = STEP_STATE_SR_LABEL[state];
               return (
                 <li
                   key={stage}
                   aria-current={isCurrent ? 'step' : undefined}
                   style={{ ...STEP_BASE_STYLE, ...variant.step }}
                 >
+                  {/*
+                    Shape-based, color-independent state marker (finding M12):
+                    ✓ complete, ● current, ○ upcoming. Decorative (aria-hidden);
+                    the accessible state is conveyed by aria-current on the step
+                    and the visually-hidden state word below.
+                  */}
                   <span
                     aria-hidden="true"
-                    style={{ ...STEP_DOT_STYLE, ...variant.dot }}
-                  />
-                  <span>{STAGE_LABELS[stage] ?? stage}</span>
+                    style={{ ...STEP_DOT_STYLE, color: variant.dot.backgroundColor }}
+                  >
+                    {STEP_STATE_GLYPH[state]}
+                  </span>
+                  <span style={{ overflowWrap: 'anywhere', minWidth: 0 }}>
+                    {STAGE_LABELS[stage] ?? stage}
+                    {srLabel ? (
+                      <span style={SR_ONLY_STYLE}>{`, ${srLabel}`}</span>
+                    ) : null}
+                  </span>
                 </li>
               );
             })}

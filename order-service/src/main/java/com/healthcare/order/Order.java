@@ -16,19 +16,27 @@ import java.util.Objects;
  * coupons, and the {@link #getAppliedCoupons() applied coupons} that were validated for
  * this order.</p>
  *
- * <p>This class is a plain state holder: it deliberately contains no transition-guard
- * logic. The legal status transitions are defined by
- * {@link OrderStatus#canTransitionTo(OrderStatus)} and enforced by
+ * <p><b>Encapsulation — mutation is service-controlled.</b> This class is a plain state
+ * holder: it deliberately contains no transition-guard logic. The legal status transitions
+ * are defined by {@link OrderStatus#canTransitionTo(OrderStatus)} and enforced by
  * {@code OrderService.updateStatus}; {@link #setStatus(OrderStatus)} here simply records
- * whatever status the service has already accepted. Monetary amounts use
- * {@link BigDecimal} for consistency with the pricing engine's BigDecimal-based discount
- * math rather than error-prone binary floating point.</p>
+ * whatever status the service has already accepted. To prevent any caller from bypassing
+ * those invariants, the three mutators ({@link #setStatus(OrderStatus)},
+ * {@link #setDiscountedTotal(BigDecimal)}, and {@link #addCoupon(Coupon)}) are
+ * <b>package-private</b>: only collaborators in the {@code com.healthcare.order} package —
+ * chiefly {@code OrderService} — may change an order's state. The HTTP/API layer lives in a
+ * different package ({@code com.healthcare.order.api}) and therefore <i>cannot</i> mutate an
+ * order directly; it must route every change through {@code OrderService}, which applies the
+ * guards. Monetary amounts use {@link BigDecimal} for consistency with the pricing engine's
+ * BigDecimal-based discount math rather than error-prone binary floating point.</p>
  *
  * <p>The applied-coupon list is never {@code null}: it starts empty, grows only through
  * {@link #addCoupon(Coupon)}, and is exposed through {@link #getAppliedCoupons()} as an
- * unmodifiable snapshot so callers cannot mutate the order's internal state. The
- * {@link Coupon} elements are the order-service validation-side coupons; callers are
- * expected to have validated them before applying them to the order.</p>
+ * unmodifiable snapshot so callers cannot mutate the order's internal state. {@code addCoupon}
+ * is idempotent per coupon <i>code</i>: re-adding a coupon whose code is already applied is a
+ * no-op, so a duplicate code can never be stacked onto the same order. The {@link Coupon}
+ * elements are the order-service validation-side coupons; callers are expected to have
+ * validated (and redeemed) them before applying them to the order.</p>
  *
  * <p>Plain in-memory Java object: no persistence, ORM, or framework annotations, and no
  * {@code CANCELLED} handling (both out of scope for this feature).</p>
@@ -101,12 +109,14 @@ public class Order {
      * guard lives in {@link OrderStatus#canTransitionTo(OrderStatus)} and is enforced by
      * {@code OrderService.updateStatus}, which calls this method only after a transition
      * has been accepted. It exists so the service can persist the new state onto the
-     * model.</p>
+     * model. It is <b>package-private</b> so only {@code com.healthcare.order} collaborators
+     * (i.e. {@code OrderService}) can advance an order's status; external callers must go
+     * through the service.</p>
      *
      * @param status the new status to record; must not be {@code null}
      * @throws NullPointerException if {@code status} is {@code null}
      */
-    public void setStatus(OrderStatus status) {
+    void setStatus(OrderStatus status) {
         this.status = Objects.requireNonNull(status, "status");
     }
 
@@ -131,10 +141,14 @@ public class Order {
     /**
      * Records the total after the pricing engine has applied this order's coupons.
      *
+     * <p>Package-private so only {@code com.healthcare.order} collaborators (i.e.
+     * {@code OrderService}, after the pricing engine has computed the total) can set it;
+     * external callers must go through the service.</p>
+     *
      * @param discountedTotal the discounted total; may be {@code null} to clear a
      *                        previously computed value
      */
-    public void setDiscountedTotal(BigDecimal discountedTotal) {
+    void setDiscountedTotal(BigDecimal discountedTotal) {
         this.discountedTotal = discountedTotal;
     }
 
@@ -153,17 +167,26 @@ public class Order {
     }
 
     /**
-     * Appends a validated coupon to this order's applied-coupon list.
+     * Appends a validated coupon to this order's applied-coupon list, unless a coupon with
+     * the same {@link Coupon#getCode() code} is already applied.
      *
-     * <p>Callers are expected to have validated the coupon (via {@code CouponValidator})
-     * before applying it; this method only records the association and does not itself
-     * re-validate the coupon.</p>
+     * <p>Callers are expected to have validated (and redeemed) the coupon (via
+     * {@code CouponValidator}) before applying it; this method only records the association
+     * and does not itself re-validate the coupon. It is <b>idempotent per code</b>: because a
+     * {@link Coupon} has code-based {@linkplain Coupon#equals(Object) equality}, re-adding a
+     * coupon whose code is already present is silently ignored, so the same coupon can never
+     * be stacked twice onto one order. Package-private so only {@code com.healthcare.order}
+     * collaborators (i.e. {@code OrderService}) can apply coupons; external callers must go
+     * through the service.</p>
      *
      * @param coupon the validated coupon to apply; must not be {@code null}
      * @throws NullPointerException if {@code coupon} is {@code null}
      */
-    public void addCoupon(Coupon coupon) {
-        appliedCoupons.add(Objects.requireNonNull(coupon, "coupon"));
+    void addCoupon(Coupon coupon) {
+        Objects.requireNonNull(coupon, "coupon");
+        if (!appliedCoupons.contains(coupon)) {
+            appliedCoupons.add(coupon);
+        }
     }
 
     /**

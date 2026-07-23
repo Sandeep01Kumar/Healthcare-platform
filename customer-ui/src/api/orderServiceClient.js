@@ -39,6 +39,7 @@ import {
   REQUEST_CONCURRENCY_LIMIT,
   assertCouponVerdict,
   assertOrderView,
+  canonicalizeCouponCode,
 } from './orderServiceContract.js';
 
 /**
@@ -60,7 +61,8 @@ import {
  * @returns {string} The normalized base URL (possibly the empty string).
  * @throws {TypeError} If the configured value is not a string.
  * @throws {Error} If the value is a non-empty string that is not a valid
- *   absolute `http`/`https` URL.
+ *   absolute `http`/`https` URL, or carries credentials (userinfo), a query
+ *   string, or a fragment.
  */
 export function resolveBaseUrl(
   raw = import.meta.env?.VITE_ORDER_SERVICE_URL ?? 'http://localhost:8080'
@@ -86,6 +88,24 @@ export function resolveBaseUrl(
     throw new Error(
       `order-service base URL must use the http or https scheme: ${trimmed}`
     );
+  }
+  // Reject secret-bearing / ambiguous URL components (finding M6). Embedded
+  // credentials (`http://user:pass@host`) would be a leaked secret; a query
+  // string or fragment on a *base* URL is never meaningful for the composed API
+  // paths and most often signals a misconfiguration or an attempt to smuggle
+  // data. The error message deliberately names only WHICH component is
+  // forbidden — it never echoes the userinfo/query/fragment value itself, so a
+  // secret cannot leak into logs or thrown messages.
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(
+      'order-service base URL must not contain embedded credentials (userinfo)'
+    );
+  }
+  if (parsed.search !== '') {
+    throw new Error('order-service base URL must not contain a query string');
+  }
+  if (parsed.hash !== '') {
+    throw new Error('order-service base URL must not contain a fragment');
   }
   return trimmed;
 }
@@ -214,6 +234,67 @@ async function readErrorDetail(res) {
 }
 
 /**
+ * Safe, user-facing messages keyed by HTTP status. These are intentionally
+ * generic and contain NO server-provided text, path, or internal detail, so a
+ * component can render them directly without leaking lower-layer information
+ * (finding M6). Diagnostics (status, path, and the server envelope) remain on
+ * the thrown {@link Error}'s `message`/`cause` for logging and are never shown
+ * to the customer.
+ *
+ * @constant {Record<number, string>}
+ */
+const HTTP_USER_MESSAGES = {
+  400: 'The request was invalid. Please check your input and try again.',
+  404: 'The requested order was not found.',
+  405: 'That operation is not supported.',
+  409: 'That status change is not allowed.',
+  413: 'The request was too large.',
+  429: 'Too many requests. Please wait a moment and try again.',
+};
+
+/**
+ * Map an HTTP status to a safe, generic user-facing message (finding M6).
+ *
+ * Any unmapped 4xx yields a generic client-error message; any 5xx (or unknown)
+ * yields a generic service-unavailable message. The returned text never
+ * contains server-provided content.
+ *
+ * @private
+ * @param {number} status - The HTTP status code.
+ * @returns {string} A safe user-facing message.
+ */
+function safeUserMessage(status) {
+  if (Object.hasOwn(HTTP_USER_MESSAGES, status)) {
+    return HTTP_USER_MESSAGES[status];
+  }
+  if (status >= 400 && status < 500) {
+    return 'The request could not be completed. Please check your input and try again.';
+  }
+  return 'The order service is temporarily unavailable. Please try again.';
+}
+
+/**
+ * Create an {@link Error} carrying a developer-facing `message` (diagnostic,
+ * which may include method/path/status/server-envelope text) PLUS a safe,
+ * user-facing `userMessage` and the HTTP `status` (`0` for transport-level
+ * failures such as a network error, timeout, or abort). UI code renders
+ * `userMessage`; logs may use `message`/`cause`. Separating the two is what
+ * keeps raw lower-layer text out of customer-facing feedback (finding M6).
+ *
+ * @private
+ * @param {string} message - Diagnostic message.
+ * @param {{status?: number, userMessage: string, cause?: unknown}} meta - Metadata.
+ * @returns {Error} The enriched error.
+ */
+function createRequestError(message, { status = 0, userMessage, cause }) {
+  const error =
+    cause !== undefined ? new Error(message, { cause }) : new Error(message);
+  error.status = status;
+  error.userMessage = userMessage;
+  return error;
+}
+
+/**
  * Issue a `fetch` request against the order-service and parse the JSON response.
  *
  * Centralizes the request/response handling shared by every exported function:
@@ -264,23 +345,38 @@ async function request(path, options = {}) {
     } catch (err) {
       if (requestSignal.aborted) {
         const reason = requestSignal.reason;
+        const isTimeout = !!reason && reason.name === 'TimeoutError';
         const detail =
           reason instanceof Error ? reason.message : String(reason ?? 'aborted');
-        throw new Error(
+        throw createRequestError(
           `order-service ${method} ${path} aborted: ${detail}`,
-          { cause: err }
+          {
+            status: 0,
+            userMessage: isTimeout
+              ? 'The request timed out. Please try again.'
+              : 'The request was cancelled.',
+            cause: err,
+          }
         );
       }
-      throw new Error(
+      throw createRequestError(
         `order-service ${method} ${path} failed: ${err.message}`,
-        { cause: err }
+        {
+          status: 0,
+          userMessage: 'The order service is unreachable. Please try again.',
+          cause: err,
+        }
       );
     }
 
     if (!res.ok) {
+      // The diagnostic detail (server envelope / raw snippet) is attached to the
+      // Error `message` for logs only; the customer sees the safe, status-mapped
+      // `userMessage` (finding M6).
       const detail = await readErrorDetail(res);
-      throw new Error(
-        `order-service ${method} ${path} failed: ${res.status}${detail}`
+      throw createRequestError(
+        `order-service ${method} ${path} failed: ${res.status}${detail}`,
+        { status: res.status, userMessage: safeUserMessage(res.status) }
       );
     }
 
@@ -496,4 +592,128 @@ export async function getOrder(orderId, options = {}) {
  */
 export async function getOrderStatus(orderId, options = {}) {
   return getOrder(orderId, options);
+}
+
+/**
+ * Normalize a caller-supplied price into the canonical non-negative decimal
+ * string the order-service expects in the `POST /orders` body.
+ *
+ * The server's `readPrice` accepts either a JSON number or a numeric string
+ * (parsed as {@code BigDecimal}); this client always transmits a string so the
+ * value survives JSON serialization without binary floating-point reformatting.
+ * The accepted grammar is intentionally strict — one or more digits, optionally
+ * followed by a fractional part — which rules out signs, scientific notation,
+ * and blank input before a request is ever issued.
+ *
+ * @private
+ * @param {number|string} price - The base (pre-discount) price.
+ * @returns {string} The canonical decimal string to send.
+ * @throws {TypeError} If `price` is neither a number nor a string.
+ * @throws {RangeError} If `price` is a non-finite/negative number, or a string
+ *   that is not a non-negative decimal.
+ * @throws {Error} If `price` is a blank string.
+ */
+function normalizeOrderPrice(price) {
+  if (typeof price === 'number') {
+    if (!Number.isFinite(price) || price < 0) {
+      throw new RangeError('price must be a finite, non-negative number');
+    }
+    return String(price);
+  }
+  if (typeof price === 'string') {
+    const trimmed = price.trim();
+    if (trimmed === '') {
+      throw new Error('price must not be blank');
+    }
+    if (!/^\d+(\.\d+)?$/.test(trimmed)) {
+      throw new RangeError('price must be a non-negative decimal string');
+    }
+    return trimmed;
+  }
+  throw new TypeError('price must be a number or a numeric string');
+}
+
+/**
+ * Normalize the coupon codes submitted with an order into a bounded, canonical,
+ * de-duplicated array.
+ *
+ * Each entry is validated as coupon input, canonicalized via
+ * {@link module:orderServiceContract.canonicalizeCouponCode} (trim + upper-case),
+ * and de-duplicated by that canonical identity preserving first-seen order. This
+ * mirrors the server, which redeems each distinct canonical code exactly once
+ * (finding C4), so submitting `"save10"` and `"SAVE10"` never double-applies.
+ *
+ * @private
+ * @param {string[]} [codes] - The applied coupon codes (defaults to none).
+ * @returns {string[]} The canonical, de-duplicated codes to send.
+ * @throws {TypeError} If `codes` is neither nullish nor an array, or an entry is
+ *   not a string.
+ * @throws {RangeError} If more than {@link module:orderServiceContract.MAX_COUPONS}
+ *   codes are supplied, or an entry exceeds the per-code length bound.
+ * @throws {Error} If an entry is blank.
+ */
+function normalizeCouponCodesForSubmit(codes) {
+  if (codes === undefined || codes === null) {
+    return [];
+  }
+  if (!Array.isArray(codes)) {
+    throw new TypeError('coupon codes must be an array');
+  }
+  if (codes.length > MAX_COUPONS) {
+    throw new RangeError(
+      `no more than ${MAX_COUPONS} coupons may be applied at once`
+    );
+  }
+  const seen = new Set();
+  const result = [];
+  for (const code of codes) {
+    validateCouponCode(code);
+    const canonical = canonicalizeCouponCode(code);
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      result.push(canonical);
+    }
+  }
+  return result;
+}
+
+/**
+ * Create an order from a base price and the coupon codes the customer applied,
+ * submitting them to the server-authoritative `POST /orders` endpoint so the
+ * coupons actually participate in pricing and redemption (findings C1/C3).
+ *
+ * The coupons the customer entered in the UI are passed here as `couponCodes`;
+ * this is the seam that connects the coupon input to the order/pricing flow.
+ * Codes are bounded, canonicalized, and de-duplicated (matching the server's
+ * once-per-canonical-code redemption) before submission, and the price is
+ * normalized to a canonical decimal string. The response is validated for the
+ * contracted order-view shape and exact status vocabulary via
+ * {@link module:orderServiceContract.assertOrderView}; a freshly created order
+ * is returned with status `CREATED`.
+ *
+ * @param {number|string} price - The base (pre-discount) price.
+ * @param {string[]} [couponCodes] - The coupon codes to apply (defaults to none).
+ * @param {Object} [options] - Request options.
+ * @param {AbortSignal} [options.signal] - Caller-supplied abort signal.
+ * @param {number} [options.timeoutMs] - Per-request timeout in milliseconds.
+ * @returns {Promise<import('./orderServiceContract.js').OrderView>} The created
+ *   order view (status `CREATED`), including its server-assigned `id`, the
+ *   `discountedTotal`, and the `appliedCoupons` the server accepted.
+ * @throws {TypeError|RangeError|Error} If `price` or `couponCodes` is not valid
+ *   input.
+ * @throws {Error} On network failure, timeout/abort, non-2xx status, a malformed
+ *   JSON body, or a structurally invalid order view. Transport/HTTP failures
+ *   carry a safe `userMessage` and numeric `status` for direct UI rendering.
+ */
+export async function createOrder(price, couponCodes = [], options = {}) {
+  const priceString = normalizeOrderPrice(price);
+  const codes = normalizeCouponCodesForSubmit(couponCodes);
+  const body = await request(ENDPOINTS.createOrder.path, {
+    method: ENDPOINTS.createOrder.method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ price: priceString, couponCodes: codes }),
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+  });
+  return assertOrderView(body);
 }

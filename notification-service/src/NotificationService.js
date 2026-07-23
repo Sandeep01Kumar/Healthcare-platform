@@ -4,29 +4,40 @@
  * Core of the `notification-service` module. Its single responsibility is to
  * **send a notification whenever an order's status changes**.
  *
- * ## Transport-agnostic library (no cross-process transport bundled)
- * This module is a **transport-agnostic library**: it builds a serialized,
- * language-neutral notification payload (see {@link NotificationPayload}) and
- * hands it to a pluggable transport sink. It deliberately does NOT open a socket,
- * bind an HTTP endpoint, or attach to a message queue itself. The concrete
- * cross-runtime bridge that carries an `order-service` (Java) status-change event
- * to this Node consumer — for example an HTTP POST, a message-queue subscriber, or
- * an IPC listener — is a **pluggable transport that is out of scope for this
- * feature** (per AAP Section 0.6.2, "concrete notification transports"). When that
- * bridge is realized, the producer serializes its event into the
- * {@link NotificationPayload} shape and this library delivers it through the
- * injected transport. A Java in-process callback cannot invoke this Node code
- * directly; a serialized transport is always required between the two runtimes.
+ * ## Transport-agnostic core behind a delivered HTTP bridge
+ * This class is a **transport-agnostic core**: it validates a status-change event,
+ * builds a serialized, language-neutral notification payload (see
+ * {@link NotificationPayload}), and hands it to a pluggable transport sink. It does
+ * not itself bind a socket — that is the job of the module's HTTP receiver (see
+ * {@link module:index}), which is a **delivered** part of this feature. The end-to-end
+ * cross-runtime bridge is concrete and wired:
  *
- * ## Planned producer contract
- * The `order-service` side is **planned** to expose a functional interface
- * (conceptually `NotificationTrigger.onStatusChange(order, from, to)`) that fires
- * on every successful order status transition
- * (`CREATED -> CONFIRMED -> DELIVERED`). That Java interface does not exist yet;
- * this file mirrors the *planned* contract as
- * {@link NotificationService#sendStatusChangeNotification}. There is intentionally
- * **no code-level import back into `order-service`** — the two sides are wired
- * together only through the serialized transport described above.
+ *   order-service (Java)                         notification-service (Node)
+ *   HttpNotificationTrigger.onStatusChange  --->  POST /notifications  (src/index.js)
+ *     serializes the transition to event JSON       parses the event and calls
+ *     and POSTs it over HTTP (java.net.http)         sendStatusChangeNotification(...)
+ *
+ * The Java producer serializes each transition into the event shape carried on the
+ * wire (contract F: `{ eventId, orderId, oldStatus, newStatus, order:{id,status}, at }`)
+ * and POSTs it to the Node receiver, which maps it onto
+ * {@link NotificationService#sendStatusChangeNotification} and delivers it through
+ * the configured transport. A Java in-process callback cannot invoke this Node code
+ * directly, so the serialized HTTP hop between the two runtimes is intrinsic to the
+ * design — not an optional add-on. What remains genuinely out of scope (per AAP
+ * Section 0.6.2) is only a **concrete downstream vendor** transport (email/SMS/push):
+ * the injected transport defaults to a benign console logger, and a real deployment
+ * swaps in its own sink.
+ *
+ * ## Producer contract (delivered)
+ * The `order-service` side exposes the functional interface
+ * `NotificationTrigger.onStatusChange(order, from, to)`, fired on every successful
+ * order status transition (`CREATED -> CONFIRMED -> DELIVERED`) and implemented by
+ * `HttpNotificationTrigger`. This file mirrors that contract as
+ * {@link NotificationService#sendStatusChangeNotification}, and the receiver adapts
+ * the POSTed event onto it. There is intentionally **no code-level import back into
+ * `order-service`** — the two sides are decoupled and wired together only through
+ * the serialized HTTP event described above, so each runtime builds and deploys
+ * independently.
  *
  * ## Idempotency (in-memory, bounded-window, best-effort)
  * Each {@link NotificationService} instance remembers which status-change
@@ -137,6 +148,12 @@ const MAX_ERROR_ECHO_LENGTH = 128;
  *
  * @callback TransportFn
  * @param {NotificationPayload} notification The notification payload to deliver.
+ * @param {{ signal?: AbortSignal }} [options] Delivery options. Carries an
+ *   {@link AbortSignal} that is `abort()`ed if the delivery exceeds the
+ *   per-delivery timeout (or the transport rejects). A signal-aware transport
+ *   (e.g. one passing `signal` to `fetch`) should cancel its work when the
+ *   signal aborts, so a timed-out delivery cannot later complete a duplicate
+ *   send. Transports that do not support cancellation may ignore this argument.
  * @returns {void|Promise<void>} Nothing, or a promise that resolves when done.
  */
 
@@ -189,6 +206,10 @@ const MAX_ERROR_ECHO_LENGTH = 128;
  * This is the serialized event DTO exchanged across the runtime boundary.
  *
  * @typedef {Object} NotificationPayload
+ * @property {string} eventId Stable cross-runtime correlation id for the
+ *   transition, `"<orderId>|<oldStatus>-><newStatus>"` — identical to the id the
+ *   Java producer emits (contract F). Use it to correlate logs across runtimes
+ *   and to drive durable/downstream de-duplication (see {@link NotificationService.eventId}).
  * @property {string} orderId The order identifier (taken from `order.id`).
  * @property {string} oldStatus The status the order transitioned FROM.
  * @property {string} newStatus The status the order transitioned TO.
@@ -235,19 +256,46 @@ function sanitizeForLog(value) {
  * default log transport applies via {@link sanitizeForLog} — so an oversized or
  * malicious value cannot inflate the thrown Error message without bound
  * (defense-in-depth). JSON encoding preserves the quoting/type cue that keeps
- * the message readable while neutralizing embedded quotes; `undefined` (for
- * which `JSON.stringify` yields no string) is rendered as the literal text
- * `undefined`, preserving the prior display behavior.
+ * the message readable while neutralizing embedded quotes.
  *
- * @param {*} value The (possibly untrusted) value to echo.
- * @returns {string} A JSON-encoded, length-bounded representation.
+ * This helper is **total and never throws**, even for values `JSON.stringify`
+ * cannot handle. It is called from {@link validateEvent} to build the message of
+ * a rejection, so it MUST NOT itself throw — otherwise a hostile field would
+ * replace the intended, actionable `RangeError`/`TypeError` with an opaque
+ * `TypeError` from `JSON.stringify` and mask the real validation failure. The
+ * following inputs are handled without throwing:
+ * - `undefined` — `JSON.stringify` yields no string; rendered as the literal
+ *   text `undefined`, preserving the prior display behavior;
+ * - `BigInt` — `JSON.stringify` throws `TypeError`; rendered as `<n>n`
+ *   (e.g. `10n`), matching how a BigInt reads in source;
+ * - a **cyclic** object — `JSON.stringify` throws `TypeError`; falls back to a
+ *   `String(value)` coercion (e.g. `[object Object]`);
+ * - a value whose `toString`/`Symbol.toPrimitive` itself throws — the coercion
+ *   is guarded and falls back to a `[unprintable <type>]` marker;
+ * - `symbol`/`function` — coerced via `String(value)` (which, unlike template
+ *   interpolation, does not throw for symbols).
+ *
+ * @param {*} value The (possibly untrusted, possibly non-serializable) value to
+ *   echo.
+ * @returns {string} A length-bounded representation; always a string.
  */
 function echoForError(value) {
-  const encoded = JSON.stringify(value);
+  let encoded;
+  try {
+    encoded = JSON.stringify(value);
+  } catch {
+    // BigInt, a cyclic structure, or a value with a throwing toJSON: fall through
+    // to the exception-safe coercion below rather than letting the throw escape.
+    encoded = undefined;
+  }
   if (typeof encoded !== 'string') {
-    // `JSON.stringify(undefined)` returns `undefined` (not a string); render the
-    // literal text so the message reads identically to the previous behavior.
-    return String(encoded);
+    // Not JSON-serializable to a string (undefined, BigInt, cyclic, symbol, ...).
+    try {
+      encoded = typeof value === 'bigint' ? `${value}n` : String(value);
+    } catch {
+      // Even coercion can throw (e.g. a throwing toString/Symbol.toPrimitive).
+      encoded = `[unprintable ${typeof value}]`;
+    }
   }
   return encoded.length > MAX_ERROR_ECHO_LENGTH
     ? `${encoded.slice(0, MAX_ERROR_ECHO_LENGTH)}…`
@@ -350,13 +398,17 @@ const defaultTransport = {
    * @returns {void}
    */
   send(notification) {
+    const eventId = sanitizeForLog(notification.eventId);
     const orderId = sanitizeForLog(notification.orderId);
     const oldStatus = sanitizeForLog(notification.oldStatus);
     const newStatus = sanitizeForLog(notification.newStatus);
     const at = sanitizeForLog(notification.at);
+    // The eventId is logged first as the correlation key so a single grep on the
+    // shared id ties this consumer log line to the Java producer's own log for
+    // the same transition (finding M11).
     console.log(
       `[notification-service] order status change ` +
-        `orderId=${orderId} ${oldStatus} -> ${newStatus} at=${at}`
+        `eventId=${eventId} orderId=${orderId} ${oldStatus} -> ${newStatus} at=${at}`
     );
   },
 };
@@ -397,9 +449,10 @@ function normalizeTransport(transport) {
 /**
  * Sends notifications on order status changes.
  *
- * This is the transport-agnostic consumer of the *planned* cross-language
- * status-change seam. It mirrors the planned Java `order-service`
- * `NotificationTrigger.onStatusChange` contract via
+ * This is the transport-agnostic consumer of the delivered cross-language
+ * status-change seam. It mirrors the `order-service` Java
+ * `NotificationTrigger.onStatusChange` contract (implemented there by
+ * `HttpNotificationTrigger`) via
  * {@link NotificationService#sendStatusChangeNotification} and delivers each
  * notification through a pluggable transport.
  *
@@ -522,6 +575,31 @@ export class NotificationService {
   }
 
   /**
+   * Builds the stable, human-readable **correlation id** for a status-change
+   * transition, shared verbatim with the Java producer.
+   *
+   * The format is `"<orderId>|<oldStatus>-><newStatus>"`, identical to the
+   * order-service `NotificationOutbox.eventId(...)` and the `eventId` carried on
+   * the wire by `HttpNotificationTrigger` (contract F). Emitting the SAME id on
+   * both runtimes is what lets a single transition be traced across the Java
+   * producer, this Node consumer, its logs, and any durable/downstream
+   * de-duplicator (finding M11).
+   *
+   * Unlike {@link dedupeKey} (a collision-free JSON tuple used for *internal*
+   * de-duplication), this id is optimized for human/log correlation. Internal
+   * de-duplication continues to use {@link dedupeKey} so an id containing the
+   * `|`/`->` delimiters cannot cause a dedupe collision.
+   *
+   * @param {OrderDTO} order The order (only `order.id` is used as identity).
+   * @param {string} oldStatus The status transitioned FROM.
+   * @param {string} newStatus The status transitioned TO.
+   * @returns {string} The stable cross-runtime correlation id.
+   */
+  static eventId(order, oldStatus, newStatus) {
+    return `${order?.id}|${oldStatus}->${newStatus}`;
+  }
+
+  /**
    * Records a successfully dispatched key, evicting the oldest entries FIFO once
    * the configured cap ({@link _maxProcessed}) is exceeded to keep the set bounded
    * (CWE-400).
@@ -566,6 +644,20 @@ export class NotificationService {
    * can fail to fire in an otherwise-idle event loop, which would let a hung
    * transport hang an awaiting caller forever and defeat the timeout's purpose.
    *
+   * ## Cancellation on timeout (transport fencing)
+   * The transport is invoked with a second argument `{ signal }` carrying an
+   * {@link AbortSignal}. When the delivery times out (or the transport rejects),
+   * the signal is `abort()`ed **before** the outer promise settles. A
+   * signal-aware transport (for example one built on `fetch`, whose `signal`
+   * option cancels the request) therefore cancels its in-progress work, so a
+   * delivery that already exceeded the timeout cannot *later* complete a real
+   * send and produce a **duplicate** notification. Transports that ignore the
+   * signal cannot be forcibly cancelled from here — for those, the stable
+   * `payload.eventId` (see {@link NotificationPayload}) is what lets a durable or
+   * downstream de-duplicator collapse a late duplicate. The `AbortController` is
+   * created lazily and only when the global `AbortController` exists (it always
+   * does on Node 22), so the method degrades gracefully if it is unavailable.
+   *
    * @private
    * @param {NotificationPayload} payload The notification payload to deliver.
    * @returns {Promise<void>} Resolves when the transport reports success; rejects
@@ -574,11 +666,20 @@ export class NotificationService {
    */
   _deliverWithTimeout(payload) {
     const timeoutMs = this._deliveryTimeoutMs;
+    // Per-delivery abort controller used to fence the transport on timeout/failure.
+    const controller =
+      typeof AbortController === 'function' ? new AbortController() : null;
+    const signal = controller ? controller.signal : undefined;
     return new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // Abort the (possibly still-running) transport BEFORE rejecting so a
+        // signal-aware transport cancels and cannot complete a late duplicate.
+        if (controller) {
+          controller.abort();
+        }
         reject(new Error(`notification delivery timed out after ${timeoutMs} ms`));
       }, timeoutMs);
       /**
@@ -595,19 +696,28 @@ export class NotificationService {
       };
       // Defer the transport call to a microtask: a synchronous throw becomes a
       // rejection, and in-flight registration in the caller always runs first.
+      // The transport receives `{ signal }` so it can honor cancellation.
       Promise.resolve()
-        .then(() => this._transport.send(payload))
+        .then(() => this._transport.send(payload, { signal }))
         .then(
           () => finish(resolve),
-          (err) => finish(reject, err)
+          (err) => {
+            // Fence a rejecting transport too, so any concurrent retryable work
+            // it spawned observes the abort.
+            if (controller && !signal.aborted) {
+              controller.abort();
+            }
+            finish(reject, err);
+          }
         );
     });
   }
 
   /**
    * Sends a notification for a single order status change — the authoritative
-   * contract method mirroring the planned Java
-   * `NotificationTrigger.onStatusChange`.
+   * contract method mirroring the delivered Java
+   * `NotificationTrigger.onStatusChange` (order-service `HttpNotificationTrigger`),
+   * which the module's HTTP receiver ({@link module:index}) adapts POSTed events onto.
    *
    * ## Behavior
    * 1. Validates the event (`order`/`order.id`, status vocabulary, that
@@ -672,6 +782,7 @@ export class NotificationService {
     }
     /** @type {NotificationPayload} */
     const payload = {
+      eventId: NotificationService.eventId(order, oldStatus, newStatus),
       orderId: order.id,
       oldStatus,
       newStatus,

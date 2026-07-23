@@ -10,9 +10,10 @@
  * - the client ({@link module:orderServiceClient}) imports these endpoints,
  *   bounds, and schema validators so its assumptions are ratified here rather
  *   than hard-coded ad hoc in the caller; and
- * - the (planned) order-service HTTP layer MUST expose exactly these routes,
- *   return the documented DTOs and status vocabulary, and emit the documented
- *   error envelope on failure.
+ * - the delivered order-service HTTP layer (`com.healthcare.order.api`) exposes
+ *   exactly these routes (`POST /coupons/validate`, `POST /orders`,
+ *   `GET /orders/{id}`, `POST /orders/{id}/status`), returns the documented DTOs
+ *   and status vocabulary, and emits the documented error envelope on failure.
  *
  * ## Transport & CORS requirements (server-side contract)
  * All responses are JSON (`Content-Type: application/json`). Because the SPA and
@@ -25,10 +26,11 @@
  * never sends credentials, so `Access-Control-Allow-Credentials` is not required.
  *
  * ## Error envelope
- * On any non-2xx response the server SHOULD return a JSON body of the shape
- * described by {@link ErrorEnvelope}. The client surfaces `error.message`/
- * `error.code` when present and always includes the HTTP method, path, and status
- * in the thrown {@link Error}.
+ * On any non-2xx response the server returns a JSON body of the shape described
+ * by {@link ErrorEnvelope}. The client records `error.message`/`error.code` and
+ * the HTTP method, path, and status on the thrown {@link Error}'s diagnostic
+ * `message` for logs, while surfacing only a safe, status-mapped `userMessage`
+ * to the customer (never raw lower-layer text).
  *
  * @module orderServiceContract
  */
@@ -87,6 +89,9 @@ export const DEFAULT_TIMEOUT_MS = 10000;
  * @constant
  * @property {{method: string, path: string}} validateCoupon
  *   `POST /coupons/validate` — body `{ code }`.
+ * @property {{method: string, path: string}} createOrder
+ *   `POST /orders` — body `{ price, couponCodes }`; returns the created order
+ *   view (status `CREATED`). Coupon redemption happens here, server-side.
  * @property {{method: string, path: (orderId: string) => string}} getOrder
  *   `GET /orders/{id}` — the id segment is URL-encoded by {@code path()}.
  */
@@ -95,11 +100,32 @@ export const ENDPOINTS = Object.freeze({
     method: 'POST',
     path: '/coupons/validate',
   }),
+  createOrder: Object.freeze({
+    method: 'POST',
+    path: '/orders',
+  }),
   getOrder: Object.freeze({
     method: 'GET',
     path: (orderId) => `/orders/${encodeURIComponent(orderId)}`,
   }),
 });
+
+/**
+ * Canonical identity for a coupon code, shared by the UI (applied-coupon
+ * de-duplication) and the client (batch de-duplication before submission) so
+ * both sides agree with the server, which treats coupon codes
+ * case-insensitively after trimming surrounding whitespace.
+ *
+ * A code entered as `"save10"`, `"SAVE10"`, or `" SAVE10 "` all canonicalize to
+ * the SAME identity (`"SAVE10"`), matching the order-service, which redeems each
+ * distinct canonical code once regardless of the casing/spacing submitted.
+ *
+ * @param {*} code The raw coupon code (coerced to a string).
+ * @returns {string} The canonical (trimmed, upper-cased) code identity.
+ */
+export function canonicalizeCouponCode(code) {
+  return String(code == null ? '' : code).trim().toUpperCase();
+}
 
 /**
  * Discount metadata carried by a coupon verdict.

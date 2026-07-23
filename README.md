@@ -8,29 +8,44 @@ Handles:
 - Customer-facing UI for coupons and order tracking
 
 An order-commerce system composed of coordinated modules that add coupon-driven
-discounting and end-to-end order tracking to the order lifecycle. The `Handles:`
-list above is the platform's charter — the capabilities the finished feature
-provides — not a claim that every capability is fully wired yet (see **Status**).
+discounting and end-to-end order tracking to the order lifecycle. Every
+capability in the `Handles:` list is delivered and covered by tests (see
+**Status**).
 
-## Status: foundation delivered, end-to-end behavior planned
+## Status: delivered end-to-end (in-memory, unauthenticated)
 
-This checkpoint delivers the **foundation** for the feature, not its complete
-end-to-end behavior:
+This checkpoint delivers the **complete end-to-end feature**: a customer can
+apply one or more coupons in the UI, create an order at a price, have the coupons
+validated and redeemed authoritatively by `order-service` and priced by
+`order-service/pricing-engine`, track the order's status, and have a notification
+emitted on every status change through a concrete Java → Node HTTP bridge.
 
-- **Delivered now:** the shared coupon domain model (with validated invariants)
-  in both Java modules; the `OrderStatus` lifecycle enum with guarded
-  transitions; the transport-agnostic notification library; the customer-ui wire
-  contract and HTTP client; and the Maven/npm build-and-test scaffolding for
-  every module.
-- **Planned (not yet implemented):** the `order-service` coupon-validation API
-  endpoint and status orchestration; the multi-coupon stacking discount in
-  `order-service/pricing-engine`; the concrete notification transport and its
-  wiring to the status-transition producer; and the customer-ui components and
-  pages. The **Features** and **Architecture** sections below describe this
-  target behavior; items are called out as planned where they are not yet built.
+- **Delivered now (implemented and tested):**
+  - `order-service/pricing-engine` — deterministic multi-coupon stacking discount
+    with `BigDecimal` money math (2-dp, HALF_UP, floored at zero); the legacy
+    `calculate(double)` entry point is preserved (`price * 0.9`).
+  - `order-service` — the authoritative server-side coupon validator with atomic
+    validate-and-redeem, the guarded `OrderStatus` lifecycle, a per-id in-memory
+    order repository, a transaction outbox for status-change events, and a
+    **JDK-only HTTP API** (`POST /coupons/validate`, `POST /orders`,
+    `GET /orders/{id}`, `POST /orders/{id}/status`) with a CORS/OPTIONS layer and
+    a JSON error envelope. The legacy no-argument `createOrder()` is preserved
+    (`"Order Created"`).
+  - `notification-service` — a Node HTTP receiver (`POST /notifications`) that
+    consumes status-change events and delivers them through a pluggable transport,
+    with abort/fencing, stable event ids, and correlated logs.
+  - `customer-ui` — a React (Vite) single-page app: the multi-coupon input, the
+    order-creation flow that submits applied coupons to `POST /orders`, the
+    `/orders/:id` tracking page with a status stepper, and the status badge — all
+    driven by the shared wire contract and HTTP client, with a real Vitest suite.
+- **Genuine remaining gaps (intentionally out of scope — see "Out of scope"):**
+  durable persistence (state is in memory and does not survive a restart),
+  authentication/authorization (the HTTP API is currently unauthenticated), and a
+  concrete downstream notification vendor (email/SMS/push); the notification
+  transport defaults to a console sink.
 
-Each module's own README states precisely what it delivers today versus what it
-plans.
+Each module's own README states precisely what it delivers and its open
+limitations.
 
 ## Repository structure and intended pull requests
 
@@ -58,69 +73,83 @@ per module, created in submodule dependency order
 ## Modules
 
 - [`customer-ui`](./customer-ui/README.md) — React (Vite) single-page app.
-  Delivered: the order-service API client and wire contract plus build
-  scaffolding; planned: the coupon input field (multi-coupon), order tracking
-  page, and current order status display.
-- [`order-service`](./order-service/README.md) — Java service. Delivered: the
-  coupon domain model and the `CREATED`/`CONFIRMED`/`DELIVERED` `OrderStatus`
-  enum with transition guards; planned: the authoritative server-side coupon
-  validation API and the order status management that orchestrates it.
+  Delivered: the multi-coupon input, the order-creation flow that submits applied
+  coupons, the `/orders/:id` tracking page with a `CREATED → CONFIRMED →
+  DELIVERED` stepper and status badge, the shared wire contract and one-way HTTP
+  client, and a real Vitest suite. Requires a running `order-service` to function.
+- [`order-service`](./order-service/README.md) — Java 21 service. Delivered: the
+  authoritative server-side coupon validation and redemption, the guarded
+  `OrderStatus` lifecycle and order orchestration, per-id in-memory storage, the
+  JDK-only HTTP API for the UI, and the Java producer half of the Java → Node
+  notification bridge.
 - [`order-service/pricing-engine`](./order-service/pricing-engine/README.md) —
-  Java module (nested). Delivered: the coupon value object and the baseline
-  `calculate(double)` entry point; planned: coupon discount calculation with
-  deterministic multi-coupon stacking.
+  Java module (nested). Delivered: the coupon value object and deterministic
+  multi-coupon stacking discount with `BigDecimal` money math; the baseline
+  `calculate(double)` entry point is preserved.
 - [`notification-service`](./notification-service/README.md) — Node service.
-  Delivered: the transport-agnostic notification library that emits a
-  notification when handed an order status change; planned: the concrete
-  transport and the wiring to the order-service status-transition producer.
+  Delivered: the HTTP receiver that consumes `order-service` status-change events
+  and the transport-agnostic notification core that emits a notification on each
+  change; a concrete downstream vendor transport remains out of scope.
 
 ## Features
 
 ### Coupons
 
-**Target behavior:** a customer submits one or more coupon codes; `order-service`
-validates them authoritatively — server-side, never trusting the client — and
-`order-service/pricing-engine` computes the resulting discount, supporting
-multiple simultaneously applied coupons that stack deterministically and are
-floored at zero so a discount can never produce a negative price.
-
-**Delivered so far:** the shared coupon domain model (with validated invariants)
-and the customer-ui wire contract that treats coupon validity as
-server-authoritative. **Planned:** the validation API endpoint, the multi-coupon
-stacking discount, and the coupon-input UI.
+A customer submits one or more coupon codes; `order-service` validates them
+authoritatively — server-side, never trusting the client — and redeems each
+unique (canonical) code atomically so a usage-limited coupon can never be
+over-redeemed. `order-service/pricing-engine` computes the resulting discount,
+supporting multiple simultaneously applied coupons that stack deterministically
+and are floored at zero so a discount can never produce a negative price. The
+customer-ui coupon input treats coupon validity as server-authoritative and
+submits the applied codes with order creation.
 
 ### Order Tracking
 
-**Target behavior:** an order moves through the guarded lifecycle
-`CREATED → CONFIRMED → DELIVERED`; invalid transitions are rejected, the current
-status is surfaced to the customer, and a notification is emitted on every status
-change.
-
-**Delivered so far:** the `OrderStatus` enum with guarded transitions and the
-notification library that sends a message when handed a status change.
-**Planned:** wiring the lifecycle into `OrderService`, surfacing status through
-the UI, and connecting the notification library to a concrete transport.
+An order moves through the guarded lifecycle `CREATED → CONFIRMED → DELIVERED`;
+invalid transitions are rejected. `OrderService` records each status change to a
+transaction outbox **before** the transition commits, then delivers it, so a
+transport failure never loses the event (it is retried). The current status is
+surfaced to the customer on the `/orders/:id` tracking page, and a notification
+is emitted on every status change via the Java → Node HTTP bridge.
 
 ## Architecture
 
 Modules are built and integrated in dependency order
-`pricing-engine → order-service → healthcare-platform`. The discount contract
-must be stable before `order-service` consumes it, and the UI and notification
+`pricing-engine → order-service → healthcare-platform`. The discount contract is
+stable before `order-service` consumes it, and the UI and notification
 integrations layer on top. The `pricing-engine` module publishes the local Maven
 artifact `com.healthcare:pricing-engine`, which `order-service` depends on.
 
-Intended runtime flow (the target once the planned seams are wired):
+Runtime flow (delivered):
 
-- `customer-ui` → `order-service`: validate coupons and read order status.
+- `customer-ui` → `order-service` (HTTP): validate coupons (`POST
+  /coupons/validate`), create an order with applied coupons (`POST /orders`), read
+  an order (`GET /orders/{id}`), and advance status (`POST /orders/{id}/status`).
 - `order-service` → `order-service/pricing-engine`: apply validated coupons to
-  compute the discounted total.
-- `order-service` → `notification-service`: trigger a notification on each status
-  change.
+  compute the stacked discounted total.
+- `order-service` → `notification-service` (HTTP): the Java `HttpNotificationTrigger`
+  producer serializes each committed status change to an event and POSTs it to the
+  Node receiver (`POST /notifications`), which delivers it through the configured
+  transport. The two runtimes are decoupled — wired only by the serialized HTTP
+  event, with no code-level import between them.
+
+### Build and run
+
+- Java modules: build `pricing-engine` first so the local Maven artifact is
+  published, then `order-service`:
+  `mvn -B -ntp -f order-service/pricing-engine/pom.xml clean install` then
+  `mvn -B -ntp -f order-service/pom.xml clean install`. Start the API with the
+  `order-service` application entry point (`OrderServiceApplication`).
+- Node modules: `notification-service` — `npm start` binds the receiver;
+  `customer-ui` — `npm install`, then `npm run dev` (or `npm run build` +
+  `npm run preview`), and `npm test` for the Vitest suite.
 
 ## Out of scope
 
-Persistence, authentication/authorization, tax/price calculation, order
-cancellation, and concrete notification transports (email/SMS/push) are not part
-of this feature. Physical multi-repository separation (separate Git repositories,
-real submodules, and per-repository branches/PRs) is likewise out of scope for
-this single-repository checkout.
+Durable persistence, authentication/authorization, tax/price calculation, order
+cancellation (no `CANCELLED` state), and concrete downstream notification vendor
+transports (email/SMS/push) are not part of this feature. Physical
+multi-repository separation (separate Git repositories, real submodules, and
+per-repository branches/PRs) is likewise out of scope for this single-repository
+checkout.

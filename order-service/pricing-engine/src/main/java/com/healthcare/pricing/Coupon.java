@@ -1,6 +1,7 @@
 package com.healthcare.pricing;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Locale;
 
 /**
@@ -34,7 +35,14 @@ import java.util.Locale;
  *       {@code subtotal * value / 100}.</li>
  *   <li>{@link Type#FIXED} — {@code value} is a non-negative absolute monetary amount
  *       subtracted directly from the running subtotal (for example
- *       {@code new BigDecimal("5.00")} means 5 currency units off).</li>
+ *       {@code new BigDecimal("5.00")} means 5 currency units off). Because a {@code FIXED}
+ *       value is money, it is <b>normalized at construction to a monetary scale of 2 decimal
+ *       places using {@link RoundingMode#HALF_UP}</b>: a sub-cent input such as
+ *       {@code 5.005} is stored as {@code 5.01}, and a coarser input such as {@code 5} is
+ *       stored as {@code 5.00}. This guarantees {@link #getValue()} for a {@code FIXED} coupon
+ *       always returns a clean two-decimal amount and no sub-cent precision can leak into the
+ *       stacking arithmetic. A {@code PERCENTAGE} value is a <i>rate</i>, not money, so its
+ *       scale is preserved as supplied (only its {@code [0, 100]} range is enforced).</li>
  * </ul>
  *
  * <p>All fields are {@code final}, so instances are immutable and safe to share across
@@ -59,6 +67,12 @@ public class Coupon {
 
     /** Upper bound (inclusive) for a {@link Type#PERCENTAGE} coupon {@link #value}. */
     private static final BigDecimal MAX_PERCENTAGE = new BigDecimal("100");
+
+    /** Monetary scale (decimal places) a {@link Type#FIXED} coupon {@link #value} is normalized to. */
+    private static final int MONEY_SCALE = 2;
+
+    /** Rounding mode used when normalizing a {@link Type#FIXED} monetary {@link #value}. */
+    private static final RoundingMode MONEY_ROUNDING = RoundingMode.HALF_UP;
 
     /** The coupon code identity (for example {@code "SAVE10"}); the stable key shared with the validation-side coupon. */
     private final String code;
@@ -86,7 +100,9 @@ public class Coupon {
      * @param value the discount magnitude, interpreted per {@code type} (percentage
      *              points for {@code PERCENTAGE}, an absolute amount for {@code FIXED});
      *              must be non-null and {@code >= 0}, and {@code <= 100} for
-     *              {@code PERCENTAGE}
+     *              {@code PERCENTAGE}. A {@code FIXED} value is money and is normalized to a
+     *              scale of 2 decimal places with {@link RoundingMode#HALF_UP}; a
+     *              {@code PERCENTAGE} value is a rate and is stored at its supplied scale
      * @throws NullPointerException     if {@code code}, {@code type}, or {@code value} is
      *                                  {@code null}
      * @throws IllegalArgumentException if {@code code} is blank, {@code value} is
@@ -116,7 +132,15 @@ public class Coupon {
         }
         this.code = normalizedCode;
         this.type = type;
-        this.value = value;
+        // A FIXED coupon's value is a monetary amount, so normalize it to the 2-decimal
+        // monetary scale (HALF_UP) at construction: this both canonicalizes coarse inputs
+        // (5 -> 5.00) and rejects sub-cent precision by rounding it away (5.005 -> 5.01),
+        // so no sub-cent value can ever be subtracted from a running subtotal downstream.
+        // A PERCENTAGE value is a rate rather than money and is stored exactly as supplied;
+        // the calculator normalizes the resulting discount amount to the monetary scale.
+        this.value = (type == Type.FIXED)
+                ? value.setScale(MONEY_SCALE, MONEY_ROUNDING)
+                : value;
     }
 
     /**
@@ -138,7 +162,10 @@ public class Coupon {
     }
 
     /**
-     * Returns the discount magnitude, interpreted according to {@link #getType()}.
+     * Returns the discount magnitude, interpreted according to {@link #getType()}. For a
+     * {@link Type#FIXED} coupon this is the monetary amount normalized to scale 2
+     * ({@link RoundingMode#HALF_UP}); for a {@link Type#PERCENTAGE} coupon this is the rate as
+     * supplied.
      *
      * @return the discount value
      */

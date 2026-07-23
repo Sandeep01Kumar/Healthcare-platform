@@ -4,9 +4,13 @@ import com.healthcare.pricing.DiscountCalculator;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Order lifecycle service — the order-service orchestrator for the Coupon and Order
@@ -40,13 +44,33 @@ import java.util.UUID;
  * {@code String}&nbsp;&harr;&nbsp;{@code Type} mapping when forwarding validated coupons to
  * the pricing engine.</p>
  *
- * <p>All state is held in memory (no persistence, ORM, or framework). The service models a
- * single {@linkplain #getCurrentOrder() current order} for the convenience no-argument
- * {@link #updateStatus(OrderStatus)} overload; the {@link #updateStatus(Order, OrderStatus)}
- * overload operates on any supplied order. The service is intended for single-threaded
- * orchestration and is not synchronized.</p>
+ * <p><b>Storage.</b> Every created order is stored in an {@link OrderRepository} keyed by its
+ * own id, so any order can be retrieved by the exact id a client supplies
+ * ({@link #getOrder(String)}) and transitioned by id ({@link #updateStatus(String, OrderStatus)}) —
+ * this is what backs the HTTP {@code GET /orders/{id}} and {@code POST /orders/{id}/status}
+ * routes. The convenience {@linkplain #getCurrentOrder() current order} (the most recently
+ * created one) is retained for the no-argument {@link #updateStatus(OrderStatus)} overload and for
+ * backward compatibility. All state is held in memory (no persistence, ORM, or framework).</p>
+ *
+ * <p><b>Atomic transitions &amp; reliable notification.</b> {@link #updateStatus(Order, OrderStatus)}
+ * runs under the order's own monitor and <b>re-reads the current status inside the lock</b> before
+ * checking the guard, closing the check-then-act (TOCTOU) race that would otherwise let two threads
+ * both advance the same order. Every successful transition is recorded in a
+ * {@link NotificationOutbox} as {@code PENDING} <b>before</b> delivery is attempted, and only marked
+ * {@code DELIVERED} once the {@link NotificationTrigger} returns; a delivery failure leaves the
+ * event pending for {@link #retryPendingNotifications()} and never fails or rolls back the
+ * (already-committed) transition. The transition and the notification therefore cannot diverge, and
+ * no status-change event is ever silently lost.</p>
+ *
+ * <p><b>Coupon redemption.</b> {@link #createOrder(BigDecimal, List)} deduplicates submitted codes
+ * by canonical form (so a duplicate cannot stack twice) and redeems each accepted coupon atomically
+ * through {@link CouponValidator#validateAndRedeem(String)}; if creation fails after some coupons
+ * were redeemed, every redemption is rolled back so usage accounting cannot leak.</p>
  */
 public class OrderService {
+
+    /** Logger for recoverable notification-delivery failures (the transition still commits). */
+    private static final Logger LOGGER = Logger.getLogger(OrderService.class.getName());
 
     /**
      * Authoritative, server-side coupon validator. Seeded with the known coupons; an empty
@@ -62,10 +86,23 @@ public class OrderService {
     private final DiscountCalculator discountCalculator;
 
     /**
-     * The order currently managed by this service, or {@code null} until the first order has
-     * been created. {@link #updateStatus(OrderStatus)} advances this order.
+     * Thread-safe, in-memory store of every created order, keyed by id. Enables retrieval and
+     * status transitions by the exact id a client supplies. Never {@code null}.
      */
-    private Order currentOrder;
+    private final OrderRepository repository;
+
+    /**
+     * Transactional outbox recording every status-change event before delivery, so a
+     * notification-transport failure can never lose an event. Never {@code null}.
+     */
+    private final NotificationOutbox outbox;
+
+    /**
+     * The order currently managed by this service, or {@code null} until the first order has
+     * been created. {@link #updateStatus(OrderStatus)} advances this order. It is the most
+     * recently created order; per-id access is via {@link #getOrder(String)}.
+     */
+    private volatile Order currentOrder;
 
     /**
      * Optional, decoupled hook invoked on every successful status transition. When
@@ -94,6 +131,8 @@ public class OrderService {
     public OrderService(CouponValidator couponValidator) {
         this.couponValidator = Objects.requireNonNull(couponValidator, "couponValidator");
         this.discountCalculator = new DiscountCalculator();
+        this.repository = new OrderRepository();
+        this.outbox = new NotificationOutbox();
     }
 
     /**
@@ -125,36 +164,72 @@ public class OrderService {
      * starts in {@link OrderStatus#CREATED} and becomes this service's
      * {@linkplain #getCurrentOrder() current order}.</p>
      *
+     * <p><b>Deduplication &amp; redemption.</b> Submitted codes are first collapsed to their
+     * canonical form (trimmed, upper-cased), preserving first-seen order, so the same coupon
+     * cannot be applied — or redeemed — twice for one order. Each unique code is then validated
+     * <b>and redeemed atomically</b> via {@link CouponValidator#validateAndRedeem(String)};
+     * only accepted coupons are applied and forwarded to the pricing engine. If any step throws
+     * after some coupons were already redeemed, every redemption made for this order is rolled
+     * back via {@link CouponValidator#releaseRedemption(String)} so usage accounting cannot leak.
+     * The finished order is stored in the {@link OrderRepository} so it can be retrieved by id.</p>
+     *
      * @param price       the base (pre-discount) price; must not be {@code null}
      * @param couponCodes the submitted coupon codes to validate and apply, in the order they
      *                    should stack; may be {@code null} or empty (treated as "no
      *                    coupons"), and individual invalid/unknown codes are skipped
      * @return the created {@link Order}, in {@link OrderStatus#CREATED}, carrying the applied
      *         coupons and the computed discounted total; never {@code null}
-     * @throws NullPointerException if {@code price} is {@code null}
+     * @throws NullPointerException     if {@code price} is {@code null}
+     * @throws IllegalArgumentException if more than {@link CouponValidator#MAX_BATCH_SIZE} codes
+     *                                  are submitted
      */
     public Order createOrder(BigDecimal price, List<String> couponCodes) {
         Objects.requireNonNull(price, "price");
+        List<String> codes = couponCodes == null ? List.of() : couponCodes;
+        if (codes.size() > CouponValidator.MAX_BATCH_SIZE) {
+            throw new IllegalArgumentException(
+                    "coupon batch size must not exceed " + CouponValidator.MAX_BATCH_SIZE
+                            + ": " + codes.size());
+        }
 
         Order order = new Order(UUID.randomUUID().toString(), price);
 
-        // Authoritative, server-side validation: collect only the valid coupons, mapping
-        // each accepted order-side coupon to the pricing-engine coupon representation.
+        // Collapse to unique canonical codes, preserving submission order, so a duplicate code
+        // is never applied or redeemed twice for the same order.
+        LinkedHashSet<String> uniqueCodes = new LinkedHashSet<>();
+        for (String code : codes) {
+            String canonical = Coupon.canonicalizeCode(code);
+            if (canonical != null && !canonical.isEmpty()) {
+                uniqueCodes.add(canonical);
+            }
+        }
+
         List<com.healthcare.pricing.Coupon> pricingCoupons = new ArrayList<>();
-        if (couponCodes != null) {
-            for (String code : couponCodes) {
-                CouponValidator.ValidationResult result = couponValidator.validate(code);
+        List<String> redeemedCodes = new ArrayList<>();
+        try {
+            // Authoritative, server-side validate-AND-redeem per unique code. Only accepted
+            // coupons are applied; invalid/unknown codes are skipped (and consume nothing).
+            for (String canonical : uniqueCodes) {
+                CouponValidator.ValidationResult result = couponValidator.validateAndRedeem(canonical);
                 if (result.isValid()) {
                     Coupon validated = result.getCoupon();
                     order.addCoupon(validated);
                     pricingCoupons.add(toPricingCoupon(validated));
+                    redeemedCodes.add(validated.getCode());
                 }
             }
+            // Delegate the stacked, zero-floored discount arithmetic to the pricing engine.
+            order.setDiscountedTotal(discountCalculator.calculate(price, pricingCoupons));
+        } catch (RuntimeException ex) {
+            // Roll back every redemption already consumed for this failed order so a partial
+            // failure cannot permanently consume coupon usage.
+            for (String code : redeemedCodes) {
+                couponValidator.releaseRedemption(code);
+            }
+            throw ex;
         }
 
-        // Delegate the stacked, zero-floored discount arithmetic to the pricing engine.
-        order.setDiscountedTotal(discountCalculator.calculate(price, pricingCoupons));
-
+        repository.save(order);
         this.currentOrder = order;
         return order;
     }
@@ -181,14 +256,22 @@ public class OrderService {
      * Advances the supplied order to the given status if and only if the transition is
      * permitted, then fires the notification trigger.
      *
-     * <p>The transition is validated against
+     * <p>The whole check-and-apply runs under the order's own monitor and <b>re-reads the
+     * current status inside the lock</b>, so two threads cannot both pass the guard and double-
+     * advance the order (the check-then-act race is closed). The transition is validated against
      * {@link OrderStatus#canTransitionTo(OrderStatus)}, which permits only the forward steps
-     * {@code CREATED -> CONFIRMED} and {@code CONFIRMED -> DELIVERED}. On a valid transition
-     * the order's status is updated and, if a {@link NotificationTrigger} is wired, its
-     * {@link NotificationTrigger#onStatusChange(Order, OrderStatus, OrderStatus)} is invoked
-     * exactly once with the old and new statuses. On an invalid transition — a skip, a
-     * backward move, a self-transition, a move out of the terminal state, or a {@code null}
-     * target — the method throws and neither mutates the order nor fires a notification.</p>
+     * {@code CREATED -> CONFIRMED} and {@code CONFIRMED -> DELIVERED}. On an invalid transition —
+     * a skip, a backward move, a self-transition, a move out of the terminal state, or a
+     * {@code null} target — the method throws and neither mutates the order, records an event,
+     * nor fires a notification.</p>
+     *
+     * <p>On a valid transition the event is first recorded in the {@link NotificationOutbox} as
+     * {@code PENDING}, then the order's status is updated and persisted (the transition commits
+     * here), and finally delivery is attempted: if a {@link NotificationTrigger} is wired its
+     * {@link NotificationTrigger#onStatusChange(Order, OrderStatus, OrderStatus)} is invoked once
+     * and, on success, the event is marked {@code DELIVERED}. A delivery failure is logged and the
+     * event is left {@code PENDING} for {@link #retryPendingNotifications()}; it does <b>not</b>
+     * propagate, because the status transition has already succeeded and must not be rolled back.</p>
      *
      * @param order the order to transition; must not be {@code null}
      * @param next  the target status; must be the immediate forward successor of the order's
@@ -199,15 +282,136 @@ public class OrderService {
      */
     public void updateStatus(Order order, OrderStatus next) {
         Objects.requireNonNull(order, "order");
-        OrderStatus current = order.getStatus();
-        if (!current.canTransitionTo(next)) {
-            throw new IllegalStateException(
-                    "Illegal order status transition: " + current + " -> " + next);
+        synchronized (order) {
+            // Re-read the current status INSIDE the lock (TOCTOU fix): the decision to transition
+            // and the mutation itself are now one atomic step for this order.
+            OrderStatus current = order.getStatus();
+            if (!current.canTransitionTo(next)) {
+                throw new IllegalStateException(
+                        "Illegal order status transition: " + current + " -> " + next);
+            }
+            // Record the event BEFORE applying/delivering so a delivery failure cannot lose it.
+            NotificationOutbox.Entry event = outbox.record(order, current, next);
+            // Apply and persist: the transition COMMITS here, independent of delivery outcome.
+            order.setStatus(next);
+            repository.save(order);
+            // Attempt delivery; success marks DELIVERED, failure leaves the event PENDING.
+            deliver(event);
         }
-        order.setStatus(next);
-        if (notificationTrigger != null) {
-            notificationTrigger.onStatusChange(order, current, next);
+    }
+
+    /**
+     * Attempts to deliver a recorded status-change event through the wired
+     * {@link NotificationTrigger}. On success the outbox entry is marked
+     * {@link NotificationOutbox.State#DELIVERED}; on a delivery failure the entry is left
+     * {@link NotificationOutbox.State#PENDING} (logged, not rethrown) so the already-committed
+     * transition is preserved and the event can be retried. When no trigger is wired the event
+     * simply remains pending until one is set and {@link #retryPendingNotifications()} runs.
+     *
+     * @param event the recorded outbox entry to deliver
+     */
+    private void deliver(NotificationOutbox.Entry event) {
+        NotificationTrigger trigger = this.notificationTrigger;
+        if (trigger == null) {
+            return;
         }
+        try {
+            trigger.onStatusChange(event.getOrder(), event.getFrom(), event.getTo());
+            outbox.markDelivered(event.getEventId());
+        } catch (RuntimeException ex) {
+            LOGGER.log(Level.WARNING, ex,
+                    () -> "notification delivery failed for event " + event.getEventId()
+                            + "; left PENDING for retry");
+        }
+    }
+
+    /**
+     * Advances the stored order with the given id to the target status, enforcing the same guard
+     * and notification semantics as {@link #updateStatus(Order, OrderStatus)}. Backs the HTTP
+     * {@code POST /orders/{id}/status} route.
+     *
+     * @param orderId the id of the order to transition; must resolve to a stored order
+     * @param next    the target status
+     * @return the transitioned order
+     * @throws OrderNotFoundException if no order with {@code orderId} exists
+     * @throws IllegalStateException  if the transition is not permitted
+     */
+    public Order updateStatus(String orderId, OrderStatus next) {
+        Order order = repository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        updateStatus(order, next);
+        return order;
+    }
+
+    /**
+     * Retrieves a stored order by the exact id supplied. Backs the HTTP {@code GET /orders/{id}}
+     * route.
+     *
+     * @param orderId the order id to look up; {@code null}-safe
+     * @return the order wrapped in an {@link Optional}, or empty if no such order exists
+     */
+    public Optional<Order> getOrder(String orderId) {
+        return repository.findById(orderId);
+    }
+
+    /**
+     * Performs authoritative, <b>read-only</b> validation of a single coupon code (no redemption
+     * is consumed). Backs the HTTP {@code POST /coupons/validate} route, which reports whether a
+     * code would be accepted without committing usage; redemption happens only when an order is
+     * created. Routing coupon validation through the service keeps the HTTP layer decoupled from
+     * the {@link CouponValidator} internals.
+     *
+     * @param code the coupon code to validate
+     * @return the normalized {@link CouponValidator.ValidationResult}; never {@code null}
+     */
+    public CouponValidator.ValidationResult validateCoupon(String code) {
+        return couponValidator.validate(code);
+    }
+
+    /**
+     * Re-attempts delivery of every status-change event still {@code PENDING} in the outbox
+     * (for example after an earlier transport outage), marking each {@code DELIVERED} on success.
+     * Safe to call repeatedly; a no-op when no trigger is wired or nothing is pending.
+     *
+     * @return the number of events successfully delivered by this call
+     */
+    public int retryPendingNotifications() {
+        NotificationTrigger trigger = this.notificationTrigger;
+        if (trigger == null) {
+            return 0;
+        }
+        int delivered = 0;
+        for (NotificationOutbox.Entry event : outbox.pending()) {
+            try {
+                trigger.onStatusChange(event.getOrder(), event.getFrom(), event.getTo());
+                outbox.markDelivered(event.getEventId());
+                delivered++;
+            } catch (RuntimeException ex) {
+                LOGGER.log(Level.WARNING, ex,
+                        () -> "retry of notification event " + event.getEventId() + " failed");
+            }
+        }
+        return delivered;
+    }
+
+    /**
+     * Returns the repository backing this service (in-memory order store). Intended for the HTTP
+     * layer and tests.
+     *
+     * @return the order repository; never {@code null}
+     */
+    public OrderRepository getRepository() {
+        return repository;
+    }
+
+    /**
+     * Returns the notification outbox backing this service. Intended for diagnostics and tests
+     * (for example asserting an event was recorded/delivered).
+     *
+     * @return the notification outbox; never {@code null}
+     */
+    public NotificationOutbox getOutbox() {
+        return outbox;
     }
 
     /**

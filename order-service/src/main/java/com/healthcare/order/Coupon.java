@@ -56,6 +56,16 @@ public final class Coupon {
     /** Upper bound (inclusive) for a {@link #TYPE_PERCENTAGE} coupon {@link #value}. */
     private static final BigDecimal MAX_PERCENTAGE = new BigDecimal("100");
 
+    /**
+     * Maximum accepted length (in characters) of a canonicalized coupon {@link #code}. A
+     * coupon code is a short human-facing token; bounding its length at construction rejects
+     * pathologically long inputs up front so an unbounded string can never be stored in the
+     * registry or echoed back through the validation API (defense against resource-exhaustion
+     * abuse, CWE-400). Kept in lock-step with the client-side {@code MAX_COUPON_CODE_LENGTH}
+     * bound declared in {@code customer-ui}'s wire contract.
+     */
+    public static final int MAX_CODE_LENGTH = 64;
+
     /** Coupon code identity (business key), e.g. {@code "SAVE10"}; never null or blank. */
     private final String code;
 
@@ -118,7 +128,8 @@ public final class Coupon {
      * and upper-cased with {@link Locale#ROOT}) via {@link #canonicalizeCode(String)}; the
      * {@code type} is likewise normalized and must be one of the supported constants.
      *
-     * @param code       the coupon code identity (business key); non-null, non-blank
+     * @param code       the coupon code identity (business key); non-null, non-blank, and no
+     *                   longer than {@link #MAX_CODE_LENGTH} characters after canonicalization
      * @param type       the discount type ({@link #TYPE_PERCENTAGE} or {@link #TYPE_FIXED});
      *                   non-null
      * @param value      the discount magnitude (percentage or fixed amount); non-null,
@@ -134,7 +145,8 @@ public final class Coupon {
      *                   exceed {@code usageLimit} when the coupon is limited
      * @throws NullPointerException     if {@code code}, {@code type}, or {@code value} is
      *                                  {@code null}
-     * @throws IllegalArgumentException if {@code code} is blank; {@code type} is not a
+     * @throws IllegalArgumentException if {@code code} is blank or exceeds
+     *                                  {@link #MAX_CODE_LENGTH}; {@code type} is not a
      *                                  supported constant; {@code value} is negative or a
      *                                  {@code PERCENTAGE} value exceeds {@code 100}; the
      *                                  validity window is reversed; {@code usageLimit} is
@@ -156,6 +168,10 @@ public final class Coupon {
         String normalizedCode = canonicalizeCode(code);
         if (normalizedCode.isEmpty()) {
             throw new IllegalArgumentException("code must not be blank");
+        }
+        if (normalizedCode.length() > MAX_CODE_LENGTH) {
+            throw new IllegalArgumentException(
+                    "code length must not exceed " + MAX_CODE_LENGTH + ": " + normalizedCode.length());
         }
         String normalizedType = type.trim().toUpperCase(Locale.ROOT);
         if (!TYPE_PERCENTAGE.equals(normalizedType) && !TYPE_FIXED.equals(normalizedType)) {

@@ -4,8 +4,36 @@
   order-service — Maven build (Coupon & Order Tracking feature)
   ============================================================================
   Build/test tooling for the order-service Java module. It hosts the mandated
-  JUnit 5 tests (OrderServiceTest, CouponValidatorTest) and produces a plain
-  JAR of the order domain classes.
+  JUnit 5 tests (OrderServiceTest, CouponValidatorTest, and the api-package
+  JsonTest, OrderApiServerTest, HttpNotificationTriggerTest) and produces a
+  runnable JAR of the order domain + HTTP API classes.
+
+  HTTP STACK / RUNTIME DEPENDENCIES (deliberately zero third-party runtime deps):
+    The HTTP API and the Java->Node notification bridge are built entirely on the
+    JDK, so this module adds NO Jackson/Gson/Spring/Netty runtime dependency:
+      - inbound HTTP server: com.sun.net.httpserver.HttpServer (JDK, jdk.httpserver)
+      - outbound HTTP client: java.net.http.HttpClient (JDK, java.net.http)
+      - JSON read/write:      com.healthcare.order.api.Json (hand-rolled, in-module)
+    This keeps the module buildable and runnable fully OFFLINE (the environment has
+    no network/registry access) and avoids pulling a web framework in for what is a
+    small, well-defined wire contract. The only compile/runtime dependency is the
+    sibling pricing-engine artifact; JUnit is test-scoped.
+
+  RUN (local, offline):
+    The entry point is com.healthcare.order.api.OrderServiceApplication (declared as
+    the JAR Main-Class below). It starts the HTTP API and wires an
+    HttpNotificationTrigger to the notification-service receiver. Because java -jar
+    ignores -cp, launch with an explicit classpath that also contains the
+    pricing-engine jar, e.g.:
+
+      PE=$(find ~/.m2/repository -name pricing-engine-1.0.0.jar | head -1)
+      java -cp "target/order-service-1.0.0.jar:$PE" \
+           com.healthcare.order.api.OrderServiceApplication
+
+    Environment overrides (both optional):
+      ORDER_SERVICE_PORT  (default 8080)   TCP port the API binds on 127.0.0.1
+      NOTIFICATION_URL    (default http://127.0.0.1:3001/notifications)
+                          the notification-service receiver the trigger POSTs to
 
   CROSS-MODULE COORDINATION (must stay consistent with the pricing-engine pom):
     groupId = com.healthcare, version = 1.0.0
@@ -62,6 +90,8 @@
         <junit.jupiter.version>5.11.4</junit.jupiter.version>
         <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
         <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
+        <!-- Core packaging plugin; used only to stamp the runnable Main-Class. -->
+        <maven-jar-plugin.version>3.1.2</maven-jar-plugin.version>
     </properties>
 
     <dependencies>
@@ -118,6 +148,28 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>${maven-surefire-plugin.version}</version>
+            </plugin>
+
+            <!--
+                maven-jar-plugin: core packaging plugin (offline-present). Its only
+                role here is to stamp the runnable entry point into the JAR manifest
+                (Main-Class: com.healthcare.order.api.OrderServiceApplication) so the
+                produced artifact is self-describing. The classpath is supplied at
+                launch time (see the RUN note in the header) rather than embedded,
+                because the sibling pricing-engine jar lives in the local Maven repo,
+                not alongside this jar — so no addClasspath/Class-Path is set.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>${maven-jar-plugin.version}</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.healthcare.order.api.OrderServiceApplication</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
             </plugin>
         </plugins>
     </build>

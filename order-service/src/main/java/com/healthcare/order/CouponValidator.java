@@ -4,10 +4,11 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Authoritative, server-side coupon validation API for the order-service.
@@ -65,14 +66,40 @@ import java.util.Objects;
  *
  * <p><b>Rate limiting.</b> Production coupon endpoints should additionally
  * rate-limit validation calls to deter code enumeration/brute force. That
- * concern belongs to the (not-yet-present) HTTP layer and is intentionally
- * <i>not</i> implemented here; no networking or throttling framework is
- * introduced by this class.</p>
+ * concern belongs to the HTTP layer ({@code com.healthcare.order.api}) and is
+ * intentionally <i>not</i> implemented here; no networking or throttling framework
+ * is introduced by this class.</p>
  *
- * <p><b>Threading.</b> The registry is a plain map; concurrent seeding and
- * validation are not synchronized. The intended usage is to seed the known
- * coupons up front and then validate, which is safe for the single-threaded and
- * read-mostly access this feature requires.</p>
+ * <p><b>Redemption model (authoritative usage accounting).</b> A coupon's
+ * {@link Coupon#getUsageCount() usageCount} is an immutable <i>baseline</i> captured
+ * when the coupon was seeded. Redemptions accrued at run time are tracked separately
+ * in an in-memory ledger keyed by canonical code, so the immutable {@link Coupon}
+ * value object never has to change. The <b>effective usage</b> of a coupon is its
+ * baseline {@code usageCount} plus the ledger count, and a coupon is exhausted when
+ * that effective usage reaches a positive {@link Coupon#getUsageLimit() usageLimit}.
+ * Two distinct operations are offered:</p>
+ * <ul>
+ *   <li>{@link #validate(String)} / {@link #validate(String, LocalDate)} —
+ *       <b>read-only</b>. It reports whether a code <i>would</i> be accepted right now
+ *       (checking effective usage) but consumes nothing. This backs the read-only
+ *       {@code POST /coupons/validate} endpoint.</li>
+ *   <li>{@link #validateAndRedeem(String)} /
+ *       {@link #validateAndRedeem(String, LocalDate)} — <b>atomically</b> validates and,
+ *       on success, consumes one redemption. This is what order creation calls, so a
+ *       usage-limited coupon cannot be over-redeemed even under concurrent order
+ *       creation. {@link #releaseRedemption(String)} returns a redemption to the ledger
+ *       to roll back a failed order.</li>
+ * </ul>
+ *
+ * <p><b>Batch bound.</b> {@link #validate(List)} rejects a batch larger than
+ * {@link #MAX_BATCH_SIZE} up front, bounding server-side fan-out (CWE-400); the bound
+ * mirrors the client-side {@code MAX_COUPONS} contract.</p>
+ *
+ * <p><b>Threading.</b> The registry is a {@link ConcurrentHashMap}, so concurrent
+ * seeding and lookup are safe. The redemption ledger is guarded so the
+ * check-then-consume in {@link #validateAndRedeem(String, LocalDate)} is atomic: two
+ * threads redeeming the last unit of a single-use coupon cannot both succeed. The
+ * class is therefore safe for concurrent validation and order creation.</p>
  */
 public class CouponValidator {
 
@@ -92,18 +119,42 @@ public class CouponValidator {
     public static final String REASON_USAGE_LIMIT_EXCEEDED = "usage limit exceeded";
 
     /**
+     * Maximum number of coupon codes accepted by a single {@link #validate(List)} batch.
+     * Bounds server-side fan-out against resource-exhaustion abuse (CWE-400) and mirrors the
+     * client-side {@code MAX_COUPONS} bound in {@code customer-ui}'s wire contract.
+     */
+    public static final int MAX_BATCH_SIZE = 25;
+
+    /**
      * In-memory registry of known coupons, keyed by {@link Coupon#getCode()}. A
-     * {@link LinkedHashMap} is used so iteration (e.g. for multi-code validation
-     * ordering during debugging) is deterministic in insertion order.
+     * {@link ConcurrentHashMap} is used so concurrent seeding and lookup are thread-safe;
+     * iteration order is not relied upon (multi-code validation iterates the caller's input
+     * list, not the registry).
      */
     private final Map<String, Coupon> registry;
+
+    /**
+     * Run-time redemption ledger, keyed by canonical coupon code. Each value counts the
+     * redemptions consumed <i>since seeding</i>, on top of the coupon's immutable baseline
+     * {@link Coupon#getUsageCount() usageCount}. Held separately from the immutable
+     * {@link Coupon} so usage accounting can advance without mutating the value object.
+     */
+    private final Map<String, AtomicInteger> redemptions;
+
+    /**
+     * Guards the check-then-consume in {@link #validateAndRedeem(String, LocalDate)} and the
+     * decrement in {@link #releaseRedemption(String)}, so effective-usage evaluation and the
+     * subsequent ledger update happen as one atomic step even under concurrent order creation.
+     */
+    private final Object redemptionLock = new Object();
 
     /**
      * Creates a validator with an empty registry. Seed coupons afterwards with
      * {@link #addCoupon(Coupon)} or {@link #addCoupons(Collection)}.
      */
     public CouponValidator() {
-        this.registry = new LinkedHashMap<>();
+        this.registry = new ConcurrentHashMap<>();
+        this.redemptions = new ConcurrentHashMap<>();
     }
 
     /**
@@ -260,13 +311,100 @@ public class CouponValidator {
             return ValidationResult.invalid(REASON_EXPIRED, coupon);
         }
 
-        // 3. Usage limit: reject an exhausted coupon.
-        if (coupon.isUsageLimitExceeded()) {
+        // 3. Usage limit: reject an exhausted coupon, measured by EFFECTIVE usage (the
+        //    coupon's immutable baseline usageCount plus any redemptions accrued in the
+        //    ledger). This read-only check consumes nothing; it reports whether the code
+        //    would be accepted right now.
+        if (isExhausted(coupon)) {
             return ValidationResult.invalid(REASON_USAGE_LIMIT_EXCEEDED, coupon);
         }
 
         // 4. All checks passed: valid, carrying the discount metadata.
         return ValidationResult.valid(coupon);
+    }
+
+    /**
+     * Atomically validates a single coupon code as of the current date and, when the code is
+     * accepted, consumes exactly one redemption from the run-time ledger.
+     *
+     * <p>This is the entry point {@code OrderService} uses during order creation: it is the
+     * <i>only</i> path that mutates usage. Unlike the read-only {@link #validate(String)},
+     * a successful result here means one redemption has been recorded, so a usage-limited
+     * coupon cannot be over-redeemed. An invalid result consumes nothing.</p>
+     *
+     * @param code the coupon code to validate and, on success, redeem
+     * @return the normalized {@link ValidationResult}; on a {@linkplain ValidationResult#isValid()
+     *         valid} result one redemption has been consumed
+     */
+    public ValidationResult validateAndRedeem(String code) {
+        return validateAndRedeem(code, LocalDate.now());
+    }
+
+    /**
+     * Atomically validates a coupon code as of an explicit date and, on success, consumes one
+     * redemption. The effective-usage check and the ledger increment are performed together
+     * under a lock, so two threads competing for the last unit of a single-use coupon cannot
+     * both succeed.
+     *
+     * @param code the coupon code to validate and, on success, redeem
+     * @param asOf the date at which to evaluate the validity window; must not be {@code null}
+     * @return the normalized {@link ValidationResult}; on a valid result one redemption has
+     *         been consumed
+     * @throws NullPointerException if {@code asOf} is {@code null}
+     */
+    public ValidationResult validateAndRedeem(String code, LocalDate asOf) {
+        Objects.requireNonNull(asOf, "asOf");
+        synchronized (redemptionLock) {
+            ValidationResult result = validate(code, asOf);
+            if (result.isValid()) {
+                // Safe under the lock: no concurrent redeem can slip between the effective-usage
+                // check inside validate(...) above and this increment.
+                redemptions
+                        .computeIfAbsent(result.getCoupon().getCode(), c -> new AtomicInteger())
+                        .incrementAndGet();
+            }
+            return result;
+        }
+    }
+
+    /**
+     * Returns one previously consumed redemption to the ledger, rolling back a
+     * {@link #validateAndRedeem(String)} that a later step could not honor (for example when
+     * order creation fails after some coupons were already redeemed). Never drives a code's
+     * ledger count below zero, and an unknown/never-redeemed code is a no-op.
+     *
+     * @param code the coupon code whose redemption should be released; canonicalized before
+     *             lookup, {@code null}-safe
+     */
+    public void releaseRedemption(String code) {
+        String canonical = Coupon.canonicalizeCode(code);
+        if (canonical == null) {
+            return;
+        }
+        synchronized (redemptionLock) {
+            AtomicInteger consumed = redemptions.get(canonical);
+            if (consumed != null && consumed.get() > 0) {
+                consumed.decrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * Reports whether a coupon has reached its redemption cap measured by effective usage: the
+     * immutable baseline {@link Coupon#getUsageCount() usageCount} plus redemptions recorded in
+     * the ledger. An {@link Coupon#UNLIMITED_USAGE unlimited} coupon is never exhausted.
+     *
+     * @param coupon the resolved coupon; must not be {@code null}
+     * @return {@code true} if effective usage has reached a positive usage limit
+     */
+    private boolean isExhausted(Coupon coupon) {
+        int limit = coupon.getUsageLimit();
+        if (limit <= Coupon.UNLIMITED_USAGE) {
+            return false;
+        }
+        AtomicInteger consumed = redemptions.get(coupon.getCode());
+        int effective = coupon.getUsageCount() + (consumed == null ? 0 : consumed.get());
+        return effective >= limit;
     }
 
     /**
@@ -279,13 +417,19 @@ public class CouponValidator {
      *
      * @param codes the coupon codes to validate; must not be {@code null} (individual
      *              entries may be {@code null}, each yielding
-     *              {@link #REASON_UNKNOWN_CODE})
+     *              {@link #REASON_UNKNOWN_CODE}) and must not exceed {@link #MAX_BATCH_SIZE}
      * @return a list of results, one per input code, in input order; never
      *         {@code null}
-     * @throws NullPointerException if {@code codes} is {@code null}
+     * @throws NullPointerException     if {@code codes} is {@code null}
+     * @throws IllegalArgumentException if {@code codes} has more than {@link #MAX_BATCH_SIZE}
+     *                                  entries
      */
     public List<ValidationResult> validate(List<String> codes) {
         Objects.requireNonNull(codes, "codes");
+        if (codes.size() > MAX_BATCH_SIZE) {
+            throw new IllegalArgumentException(
+                    "coupon batch size must not exceed " + MAX_BATCH_SIZE + ": " + codes.size());
+        }
         LocalDate asOf = LocalDate.now();
         List<ValidationResult> results = new ArrayList<>(codes.size());
         for (String code : codes) {

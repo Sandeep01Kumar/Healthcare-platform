@@ -122,10 +122,20 @@ const FALLBACK_STYLE = {
  * (uppercase); only the *label* is humanized. Unknown or missing values degrade
  * to a neutral fallback badge and never throw.
  *
- * The badge is announced by assistive technology: it carries `role="status"`
- * and `aria-live="polite"` so screen readers politely announce the value when
- * an order advances, and an `aria-label` of the form `Order status: <label>`
- * gives listeners the full context rather than a bare word.
+ * The badge is announced by assistive technology through a SINGLE live-region
+ * mechanism: it carries `role="status"`, whose implicit `aria-live="polite"`
+ * politely announces the value when an order advances. The explicit
+ * `aria-live` attribute is intentionally omitted to avoid declaring the same
+ * live region twice (finding N2); `role="status"` alone is authoritative. An
+ * `aria-label` of the form `Order status: <label>` gives listeners the full
+ * context rather than a bare word.
+ *
+ * Label and color lookups are performed against OWN keys only (via
+ * {@link Object.hasOwn}), so a hostile or accidental status string that collides
+ * with an inherited `Object.prototype` member (for example `"toString"`,
+ * `"constructor"`, or `"__proto__"`) can never resolve to an inherited function
+ * or object; such a value degrades to the neutral fallback exactly like any
+ * other unrecognized status (finding N2).
  *
  * @param {object} props - Component props.
  * @param {'CREATED'|'CONFIRMED'|'DELIVERED'} [props.status] - The current order
@@ -134,13 +144,29 @@ const FALLBACK_STYLE = {
  * @returns {JSX.Element} An accessible, inline order-status badge.
  */
 export default function OrderStatusBadge({ status }) {
-  const label = STATUS_LABELS[status] ?? status ?? 'Unknown';
-  const variant = STATUS_STYLES[status] ?? FALLBACK_STYLE;
+  // Own-key lookups only: a status string that collides with an inherited
+  // Object.prototype member (e.g. "toString"/"constructor"/"__proto__") must
+  // NOT resolve to that inherited value (finding N2). A recognized status maps
+  // to its friendly label + color variant; a non-string or unrecognized value
+  // degrades to the raw string (when displayable) and the neutral fallback.
+  const isKnown =
+    typeof status === 'string' && Object.hasOwn(STATUS_LABELS, status);
+  let label;
+  if (isKnown) {
+    label = STATUS_LABELS[status];
+  } else if (typeof status === 'string' && status !== '') {
+    label = status;
+  } else {
+    label = 'Unknown';
+  }
+  const variant =
+    typeof status === 'string' && Object.hasOwn(STATUS_STYLES, status)
+      ? STATUS_STYLES[status]
+      : FALLBACK_STYLE;
 
   return (
     <span
       role="status"
-      aria-live="polite"
       aria-label={`Order status: ${label}`}
       style={{ ...BADGE_BASE_STYLE, ...variant.badge }}
     >

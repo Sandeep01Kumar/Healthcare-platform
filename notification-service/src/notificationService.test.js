@@ -65,7 +65,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { NotificationService } from './NotificationService.js';
-import defaultInstance, { NotificationService as NsFromIndex } from './index.js';
+import defaultInstance, {
+  NotificationService as NsFromIndex,
+  createReceiver,
+  start,
+} from './index.js';
 
 /**
  * Strict `Date.prototype.toISOString()` grammar
@@ -431,4 +435,369 @@ test('times out a transport that never settles and stays retryable', async () =>
     () => service.sendStatusChangeNotification({ id: 't' }, 'CREATED', 'CONFIRMED'),
     /timed out after 25 ms/);
   assert.equal(attempts, 2, 'a timed-out transition must remain retryable');
+});
+
+/* ------------------------------------------------------------------ *
+ * 11. M11 — stable cross-runtime eventId. The dispatched payload carries
+ *     the same "<orderId>|<from>-><to>" correlation id the Java producer
+ *     emits (contract F), so a single transition is traceable across
+ *     runtimes and by a durable/downstream de-duplicator.
+ * ------------------------------------------------------------------ */
+
+test('M11: the dispatched payload carries the stable cross-runtime eventId', async () => {
+  const spy = createSpyTransport();
+  const service = new NotificationService(spy);
+  const result = await service.sendStatusChangeNotification({ id: 'ev1' }, 'CREATED', 'CONFIRMED');
+  const expected = 'ev1|CREATED->CONFIRMED';
+  // The SendResult payload and the payload the transport actually receives both
+  // carry the eventId as a first-class field.
+  assert.equal(result.payload.eventId, expected);
+  assert.equal(spy.calls[0].eventId, expected, 'transport sees the eventId in the payload');
+  // The static helper produces the identical id the Java producer emits (contract
+  // F): order-service NotificationOutbox.eventId(...) == NotificationService.eventId(...).
+  assert.equal(
+    NotificationService.eventId({ id: 'ev1' }, 'CREATED', 'CONFIRMED'),
+    expected,
+    'the Node eventId format matches the Java producer verbatim');
+  // The internal dedupe key stays a distinct, collision-free JSON tuple (NOT the
+  // human-readable eventId), so an id containing the `|`/`->` delimiters can never
+  // cause a dedupe collision.
+  assert.equal(result.key, JSON.stringify(['ev1', 'CREATED', 'CONFIRMED']));
+  assert.notEqual(result.key, expected);
+});
+
+/* ------------------------------------------------------------------ *
+ * 12. M3 — transport fencing on timeout. When a delivery exceeds the
+ *     per-delivery timeout, the transport's AbortSignal is aborted BEFORE
+ *     the outer promise rejects, so a signal-aware (fetch-style) transport
+ *     cancels its in-flight work and cannot LATER complete a duplicate
+ *     send. The timed-out transition is not remembered and stays retryable.
+ * ------------------------------------------------------------------ */
+
+test('M3: a timed-out delivery aborts the transport signal and stays retryable (fencing)', async () => {
+  let attempts = 0;
+  /** @type {(AbortSignal|undefined)[]} */
+  const signals = [];
+  let firstObservedAbort = false;
+  const transport = {
+    send(payload, options) {
+      attempts += 1;
+      const signal = options && options.signal;
+      signals.push(signal);
+      if (attempts === 1) {
+        // Model a signal-aware transport (like one built on fetch): it stays
+        // pending until its signal is aborted, then cancels. By the time the abort
+        // fires, the per-delivery timeout has already rejected the outer delivery,
+        // so this late settle is fenced out and cannot complete a duplicate send.
+        return new Promise((resolve, reject) => {
+          if (signal) {
+            signal.addEventListener('abort', () => {
+              firstObservedAbort = true;
+              reject(new Error('aborted'));
+            }, { once: true });
+          }
+        });
+      }
+      // The retry succeeds promptly.
+      return Promise.resolve();
+    },
+  };
+  const service = new NotificationService(transport, { deliveryTimeoutMs: 20 });
+
+  await assert.rejects(
+    () => service.sendStatusChangeNotification({ id: 'fence-1' }, 'CREATED', 'CONFIRMED'),
+    /timed out after 20 ms/);
+
+  // The transport was invoked with an AbortSignal, and the timeout aborted it
+  // BEFORE the delivery rejected — so a signal-aware transport cancels in-flight
+  // work and cannot later complete a duplicate (finding M3).
+  assert.ok(signals[0] instanceof AbortSignal, 'transport received an AbortSignal');
+  assert.equal(signals[0].aborted, true, 'the signal was aborted on timeout');
+  assert.equal(firstObservedAbort, true, 'the transport observed the abort');
+
+  // The timed-out transition was NOT remembered: a retry re-invokes the transport
+  // (not short-circuited as a duplicate) and now succeeds.
+  const retry = await service.sendStatusChangeNotification({ id: 'fence-1' }, 'CREATED', 'CONFIRMED');
+  assert.equal(retry.dispatched, true);
+  assert.equal(retry.duplicate, false);
+  assert.equal(attempts, 2, 'the transition remained retryable after the timeout');
+});
+
+/* ------------------------------------------------------------------ *
+ * 13. N1 — hostile-value validation messages. A rejection message built
+ *     from an untrusted field must NEVER be replaced by an opaque
+ *     `JSON.stringify` TypeError: the intended RangeError/TypeError (and
+ *     an actionable, BOUNDED echo of the bad value) must survive, even for
+ *     BigInt, cyclic, unprintable, and oversized inputs.
+ * ------------------------------------------------------------------ */
+
+test('N1: a BigInt status is rejected with a bounded RangeError, not a JSON.stringify TypeError', async () => {
+  const spy = createSpyTransport();
+  const service = new NotificationService(spy);
+  await assert.rejects(
+    () => service.sendStatusChangeNotification({ id: 'n1' }, 'CREATED', 10n),
+    (err) => {
+      // The real validation failure survives — WITHOUT the total echoForError, the
+      // message construction would have thrown a TypeError from JSON.stringify(10n)
+      // and masked this RangeError.
+      assert.ok(err instanceof RangeError, 'must be the intended RangeError, not a TypeError');
+      assert.match(err.message, /newStatus must be one of/);
+      assert.match(err.message, /10n/, 'the BigInt is echoed readably as 10n');
+      return true;
+    });
+  assert.equal(spy.calls.length, 0, 'a rejected event never reaches the transport');
+});
+
+test('N1: a cyclic order.status is rejected with a RangeError (no stringify throw)', async () => {
+  const spy = createSpyTransport();
+  const service = new NotificationService(spy);
+  const cyclic = {};
+  cyclic.self = cyclic;
+  await assert.rejects(
+    () => service.sendStatusChangeNotification({ id: 'n2', status: cyclic }, 'CREATED', 'CONFIRMED'),
+    (err) => {
+      assert.ok(err instanceof RangeError, 'must be a RangeError, not a JSON.stringify TypeError');
+      assert.match(err.message, /order\.status must be one of/);
+      return true;
+    });
+  assert.equal(spy.calls.length, 0);
+});
+
+test('N1: an order.status whose toString AND toJSON throw yields an [unprintable] echo', async () => {
+  const spy = createSpyTransport();
+  const service = new NotificationService(spy);
+  const hostile = {
+    toJSON() { throw new Error('no json'); },
+    toString() { throw new Error('no string'); },
+    [Symbol.toPrimitive]() { throw new Error('no primitive'); },
+  };
+  await assert.rejects(
+    () => service.sendStatusChangeNotification({ id: 'n3', status: hostile }, 'CREATED', 'CONFIRMED'),
+    (err) => {
+      // Both JSON.stringify and String() coercion throw for this value; the total
+      // echoForError falls back to a safe marker instead of escaping the throw.
+      assert.ok(err instanceof RangeError, 'the real validation error is preserved');
+      assert.match(err.message, /order\.status must be one of/);
+      assert.match(err.message, /\[unprintable object\]/, 'hostile value is safely rendered');
+      return true;
+    });
+  assert.equal(spy.calls.length, 0);
+});
+
+test('N1: an oversized status echo is bounded (defense-in-depth against amplification)', async () => {
+  const spy = createSpyTransport();
+  const service = new NotificationService(spy);
+  const huge = 'X'.repeat(10000);
+  await assert.rejects(
+    () => service.sendStatusChangeNotification({ id: 'n4' }, 'CREATED', huge),
+    (err) => {
+      assert.ok(err instanceof RangeError);
+      // The echoed value is truncated with an ellipsis so the message stays bounded
+      // rather than ballooning to ~10 000 characters.
+      assert.ok(err.message.length < 400, `message must be bounded, got ${err.message.length}`);
+      assert.match(err.message, /…/, 'oversized echo is truncated with an ellipsis');
+      return true;
+    });
+  assert.equal(spy.calls.length, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * 14. C6/M8 — HTTP receiver integration (the delivered Java -> Node bridge
+ *     consumer). A real node:http server is bound on an ephemeral port and
+ *     exercised over real HTTP with fetch, so a wiring or response-code
+ *     defect cannot hide behind a green in-process suite (finding M8, the
+ *     same class of defect that a live test caught in order-service).
+ * ------------------------------------------------------------------ */
+
+/**
+ * Starts the receiver on an ephemeral port with a fresh spy transport, so a test
+ * can assert both the HTTP response and what actually reached the transport.
+ *
+ * @param {object} [serviceOptions] Options forwarded to the NotificationService.
+ * @returns {Promise<{ baseUrl: string, transport: { calls: object[] }, service: NotificationService, close: () => Promise<void> }>}
+ */
+async function startSpyReceiver(serviceOptions) {
+  const transport = createSpyTransport();
+  const service = new NotificationService(transport, serviceOptions);
+  const { server, port, host } = await start({ port: 0, host: '127.0.0.1', service });
+  return {
+    baseUrl: `http://${host}:${port}`,
+    transport,
+    service,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+/**
+ * POSTs a body to the receiver. By default the body is JSON-encoded and sent to
+ * `/notifications`; pass `raw` to send a verbatim string, or `path` to target a
+ * different route.
+ *
+ * @param {string} baseUrl The receiver base URL.
+ * @param {unknown} body The body to send.
+ * @param {{ raw?: boolean, path?: string }} [opts] Encoding/route options.
+ * @returns {Promise<Response>} The fetch response.
+ */
+function postEvent(baseUrl, body, { raw = false, path = '/notifications' } = {}) {
+  return fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: raw ? body : JSON.stringify(body),
+  });
+}
+
+/**
+ * Builds a well-formed contract-F status-change event, with optional overrides.
+ *
+ * @param {object} [overrides] Fields to override on the base event.
+ * @returns {object} A contract-F event body.
+ */
+function contractFEvent(overrides = {}) {
+  return {
+    eventId: 'R1|CREATED->CONFIRMED',
+    orderId: 'R1',
+    oldStatus: 'CREATED',
+    newStatus: 'CONFIRMED',
+    order: { id: 'R1', status: 'CONFIRMED' },
+    at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+test('C6: the receiver dispatches a valid contract-F event (200) and echoes the eventId', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await postEvent(rec.baseUrl, contractFEvent());
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.dispatched, true);
+    assert.equal(body.duplicate, false);
+    assert.equal(body.eventId, 'R1|CREATED->CONFIRMED');
+    // The mapped payload reached the transport exactly once, carrying the same id.
+    assert.equal(rec.transport.calls.length, 1);
+    assert.equal(rec.transport.calls[0].eventId, 'R1|CREATED->CONFIRMED');
+    assert.equal(rec.transport.calls[0].orderId, 'R1');
+    assert.equal(rec.transport.calls[0].oldStatus, 'CREATED');
+    assert.equal(rec.transport.calls[0].newStatus, 'CONFIRMED');
+    assertIso8601(rec.transport.calls[0].at);
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: a replayed event is reported as a duplicate (200) and not re-dispatched', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const first = await (await postEvent(rec.baseUrl, contractFEvent())).json();
+    const second = await postEvent(rec.baseUrl, contractFEvent());
+    const secondBody = await second.json();
+    assert.equal(first.dispatched, true);
+    assert.equal(second.status, 200);
+    assert.equal(secondBody.dispatched, false);
+    assert.equal(secondBody.duplicate, true);
+    assert.equal(secondBody.eventId, 'R1|CREATED->CONFIRMED', 'the duplicate still carries the eventId');
+    assert.equal(rec.transport.calls.length, 1, 'the duplicate must not reach the transport again');
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: a malformed JSON body is rejected (400) and never dispatched', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await postEvent(rec.baseUrl, 'not-json{', { raw: true });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error.message, /invalid JSON/i);
+    assert.equal(rec.transport.calls.length, 0);
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: an invalid transition is rejected (400) and never dispatched', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await postEvent(rec.baseUrl, contractFEvent({
+      eventId: 'R1|CREATED->DELIVERED',
+      newStatus: 'DELIVERED',
+      order: { id: 'R1', status: 'DELIVERED' },
+    }));
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error.message, /invalid transition CREATED -> DELIVERED/);
+    assert.equal(rec.transport.calls.length, 0);
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: a non-POST method is rejected (405)', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await fetch(`${rec.baseUrl}/notifications`, { method: 'GET' });
+    assert.equal(res.status, 405);
+    const body = await res.json();
+    assert.match(body.error.message, /POST/);
+    assert.equal(rec.transport.calls.length, 0);
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: an unknown route is rejected (404)', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    const res = await postEvent(rec.baseUrl, contractFEvent(), { path: '/nope' });
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.match(body.error.message, /no such route/);
+    assert.equal(rec.transport.calls.length, 0);
+  } finally {
+    await rec.close();
+  }
+});
+
+test('C6: an oversized body is refused without dispatch (bounded input, CWE-400)', async () => {
+  const rec = await startSpyReceiver();
+  try {
+    // Exceed MAX_BODY_BYTES (64 KiB) so the receiver caps the read.
+    const huge = 'x'.repeat(70 * 1024);
+    let status = 0;
+    try {
+      const res = await postEvent(rec.baseUrl, huge, { raw: true });
+      status = res.status;
+    } catch {
+      // The receiver destroys the request stream when the cap is exceeded, which a
+      // client can observe as a dropped connection rather than a clean 413. Either
+      // outcome proves the oversized body was refused before any dispatch.
+      status = 413;
+    }
+    assert.ok(status === 413 || status === 400, `oversized body must be refused (got ${status})`);
+    assert.equal(rec.transport.calls.length, 0, 'an oversized body must never be dispatched');
+  } finally {
+    await rec.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 15. C6 — direct factory/listener contract. createReceiver() builds a
+ *     configured server WITHOUT binding a socket (import-safe), and start()
+ *     binds an ephemeral port and is cleanly closable.
+ * ------------------------------------------------------------------ */
+
+test('C6: createReceiver returns a configured server that is not yet listening', () => {
+  const server = createReceiver();
+  assert.equal(typeof server.listen, 'function', 'is an http.Server');
+  assert.equal(server.listening, false, 'the factory must not bind a socket (import-safe)');
+});
+
+test('C6: start() binds an ephemeral port and can be closed', async () => {
+  const { server, port } = await start({ port: 0, host: '127.0.0.1' });
+  try {
+    assert.ok(Number.isInteger(port) && port > 0, 'an ephemeral port was assigned');
+    assert.equal(server.listening, true, 'the server is listening after start()');
+  } finally {
+    await new Promise((resolve) => server.close(() => resolve()));
+  }
 });

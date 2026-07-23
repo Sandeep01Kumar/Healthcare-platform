@@ -48,7 +48,22 @@ import java.util.List;
  * <h2>Monetary safety</h2>
  * <p>All arithmetic uses {@link BigDecimal} with {@link RoundingMode#HALF_UP} at a fixed
  * monetary scale of <b>2 decimal places</b>; {@code double}/{@code float} are never used, so
- * results are free of binary floating-point rounding error.</p>
+ * results are free of binary floating-point rounding error. The running subtotal is
+ * <b>re-normalized to scale 2 after every coupon step</b> — not only at the end — so a
+ * {@code FIXED} value carrying more than two decimals, or any scale accumulated by a prior
+ * subtraction, can never leak sub-cent precision into a subsequent {@code PERCENTAGE} coupon's
+ * base. (The same-module {@link Coupon} additionally normalizes a {@code FIXED} value to scale
+ * 2 at construction, so this per-step normalization is a defensive second layer that keeps the
+ * engine correct for any {@code Coupon} it is handed.)</p>
+ *
+ * <h2>Duplicate and oversized coupons</h2>
+ * <p>The engine applies <b>every</b> coupon in the supplied list, in order, including
+ * duplicates — deduplication is the <i>caller's</i> responsibility (the order-service
+ * orchestration layer collapses coupons by canonical code before handing a list here). A
+ * {@code FIXED} value larger than the running subtotal, or a {@code PERCENTAGE} stack that
+ * would exceed 100%, is not rejected: the per-step zero-floor simply clamps the subtotal to
+ * {@code 0.00}. There is no upper cap on list length in the engine; the caller bounds the batch
+ * size before invoking it.</p>
  *
  * <h2>Null / empty handling</h2>
  * <p>A {@code null} {@code price} is treated as {@code 0.00}, and a negative {@code price} is
@@ -124,8 +139,15 @@ public class CouponDiscountCalculator {
                 running = running.subtract(coupon.getValue());
             }
 
+            // Re-normalize to the monetary scale after EVERY step. A FIXED subtraction can
+            // leave the subtotal at a scale wider than 2 if a value ever carried extra
+            // decimals; normalizing here (rather than only in the final return) guarantees the
+            // base handed to the next coupon's PERCENTAGE math is a clean 2-decimal amount, so
+            // no sub-cent precision can compound across steps.
+            running = running.setScale(MONEY_SCALE, ROUNDING);
+
             // Zero-floor per step: a discount can never drive the subtotal below zero.
-            if (running.compareTo(BigDecimal.ZERO) < 0) {
+            if (running.compareTo(ZERO_MONEY) < 0) {
                 running = ZERO_MONEY;
             }
         }

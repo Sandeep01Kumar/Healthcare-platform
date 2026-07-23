@@ -26,7 +26,7 @@
  * @module OrderTrackingPage
  */
 
-import { useState, useEffect, useId } from 'react';
+import { useState, useEffect, useId, useRef } from 'react';
 import { getOrder } from '../api/orderServiceClient.js';
 import OrderStatusBadge from '../components/OrderStatusBadge.jsx';
 
@@ -368,6 +368,24 @@ export default function OrderTrackingPage({ orderId }) {
   const [reloadToken, setReloadToken] = useState(0);
   const headingId = useId();
 
+  // Focus-restoration wiring for keyboard/accessibility (finding MIN-1).
+  //
+  // Activating "Refresh" disables that button while the reload is in flight
+  // (and "Retry" is unmounted when the error view is replaced by the loading
+  // view), which blurs the just-activated control and drops focus to
+  // `document.body`. To keep keyboard focus logical, we restore it to a
+  // sensible control once the reload settles: the Refresh button if an order
+  // loaded, else the Retry button if the reload failed, else the page heading.
+  //
+  // `restoreFocusRef` is a one-shot flag armed ONLY by `refresh()` (a user
+  // action). It is deliberately NOT armed on mount or on `orderId` navigation,
+  // so the router's own focus-to-<h1>-on-navigation behavior in `App.jsx`
+  // (finding M12) is fully preserved and never fought over.
+  const refreshButtonRef = useRef(null);
+  const retryButtonRef = useRef(null);
+  const headingRef = useRef(null);
+  const restoreFocusRef = useRef(false);
+
   useEffect(() => {
     let active = true;
 
@@ -433,13 +451,38 @@ export default function OrderTrackingPage({ orderId }) {
     };
   }, [orderId, reloadToken]);
 
+  // Restore keyboard focus after a user-initiated refresh/retry settles
+  // (finding MIN-1). This runs after each load state change, but acts ONLY when
+  // the reload was armed by `refresh()` and the request is no longer in flight,
+  // so it fires exactly once per manual refresh/retry and never steals focus on
+  // mount or navigation. The target is chosen from whatever control is actually
+  // present after the load: Refresh (order loaded) -> Retry (reload failed) ->
+  // heading (neither control rendered, e.g. an empty result).
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+    if (!restoreFocusRef.current) {
+      return;
+    }
+    restoreFocusRef.current = false;
+    const target =
+      refreshButtonRef.current || retryButtonRef.current || headingRef.current;
+    target?.focus();
+  }, [loading, error, order]);
+
   /**
    * Trigger a manual refresh/retry by advancing the reload token, which re-runs
    * the fetch effect (and aborts any in-flight request first).
    *
+   * Arms the one-shot focus-restoration flag first so keyboard focus returns to
+   * a logical control once the reload settles (finding MIN-1); the flag is read
+   * and cleared by the focus-restoration effect above.
+   *
    * @returns {void}
    */
   function refresh() {
+    restoreFocusRef.current = true;
     setReloadToken((token) => token + 1);
   }
 
@@ -461,6 +504,7 @@ export default function OrderTrackingPage({ orderId }) {
           navigation without adding it to the sequential tab order.
         */}
         <h1
+          ref={headingRef}
           id={headingId}
           tabIndex={-1}
           style={{ margin: 0, fontSize: '1.5rem' }}
@@ -471,6 +515,7 @@ export default function OrderTrackingPage({ orderId }) {
           {order ? <OrderStatusBadge status={order.status} /> : null}
           {order ? (
             <button
+              ref={refreshButtonRef}
               type="button"
               onClick={refresh}
               disabled={loading}
@@ -493,7 +538,12 @@ export default function OrderTrackingPage({ orderId }) {
             {error}
           </p>
           {orderId ? (
-            <button type="button" onClick={refresh} style={REFRESH_BUTTON_STYLE}>
+            <button
+              ref={retryButtonRef}
+              type="button"
+              onClick={refresh}
+              style={REFRESH_BUTTON_STYLE}
+            >
               Retry
             </button>
           ) : null}

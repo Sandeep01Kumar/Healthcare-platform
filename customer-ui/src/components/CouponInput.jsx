@@ -23,9 +23,9 @@
  * @module CouponInput
  */
 
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { validateCoupon } from '../api/orderServiceClient.js';
-import { canonicalizeCouponCode } from '../api/orderServiceContract.js';
+import { canonicalizeCouponCode, MAX_COUPONS } from '../api/orderServiceContract.js';
 
 /**
  * Render the opaque `discount` metadata for display without ever throwing.
@@ -139,6 +139,31 @@ export default function CouponInput({
   const statusId = `${baseId}-status`;
   const appliedLabelId = `${baseId}-applied`;
 
+  // A ref to the coupon <input> so keyboard / assistive-technology focus can be
+  // RESTORED to it after an async in-place update (finding MIN-1). Disabling the
+  // focused control during a submit, or unmounting a Remove button, otherwise
+  // drops focus to <body> and forces the user to Tab from the top of the page.
+  const inputRef = useRef(null);
+  // Armed (set true) right before an operation that will re-render this
+  // component — an Apply submit cycle, or a Remove — and consumed by the effect
+  // below to move focus back to a logical, always-present control once the
+  // update settles.
+  const pendingFocusRef = useRef(false);
+
+  // Restore focus after a coupon Apply (success OR error) or a Remove settles.
+  // Keyed on `submitting` and `appliedCoupons` so it runs after the DOM has
+  // re-rendered (the input is re-enabled once `submitting` clears; the list is
+  // updated after a remove). It is a NO-OP on mount and on any unrelated
+  // re-render because `pendingFocusRef` is only armed by a user action, so focus
+  // is never stolen unexpectedly (finding MIN-1). Focusing is deferred until
+  // `submitting` is false because focusing a disabled element is a no-op.
+  useEffect(() => {
+    if (pendingFocusRef.current && !submitting) {
+      pendingFocusRef.current = false;
+      inputRef.current?.focus();
+    }
+  }, [submitting, appliedCoupons]);
+
   /**
    * Validate and apply the entered coupon.
    *
@@ -169,7 +194,22 @@ export default function CouponInput({
       setFeedback({ tone: 'info', message: `Coupon "${trimmed}" is already applied.` });
       return;
     }
+    // Apply-time cap (finding INFO-4): bound the applied list to MAX_COUPONS at
+    // the point of entry, matching the client's create/validate cap. Without
+    // this gate the interactive list could grow past the limit and only fail at
+    // order creation with a message that misattributes the cause to "price".
+    // This is input hygiene, not a validity decision, so no request is issued.
+    if (appliedCoupons.length >= MAX_COUPONS) {
+      setFeedback({
+        tone: 'info',
+        message: `You can apply at most ${MAX_COUPONS} coupons. Remove one to add another.`,
+      });
+      return;
+    }
 
+    // Arm focus restoration for when this submit cycle settles (finding MIN-1),
+    // then disable the form while the validation request is in flight.
+    pendingFocusRef.current = true;
     setSubmitting(true);
     try {
       // The server is the sole authority on validity; we relay the canonical
@@ -219,6 +259,11 @@ export default function CouponInput({
    * @returns {void}
    */
   function handleRemove(couponCode) {
+    // Arm focus restoration (finding MIN-1): the clicked Remove button is about
+    // to unmount as the parent drops the entry, which would otherwise leave
+    // focus on <body>. The effect moves focus back to the always-present coupon
+    // input once the list re-renders.
+    pendingFocusRef.current = true;
     onRemoveCoupon(couponCode);
     setFeedback({ tone: 'info', message: `Coupon "${couponCode}" removed.` });
   }
@@ -239,6 +284,7 @@ export default function CouponInput({
       <form
         onSubmit={handleSubmit}
         noValidate
+        aria-busy={submitting}
         style={{
           display: 'flex',
           flexWrap: 'wrap',
@@ -251,6 +297,7 @@ export default function CouponInput({
             Coupon code
           </label>
           <input
+            ref={inputRef}
             id={inputId}
             type="text"
             value={code}

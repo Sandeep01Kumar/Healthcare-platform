@@ -247,7 +247,7 @@ const HTTP_USER_MESSAGES = {
   400: 'The request was invalid. Please check your input and try again.',
   404: 'The requested order was not found.',
   405: 'That operation is not supported.',
-  409: 'That status change is not allowed.',
+  409: 'That request conflicts with the current state of the order. Please try again.',
   413: 'The request was too large.',
   429: 'Too many requests. Please wait a moment and try again.',
 };

@@ -140,6 +140,32 @@ describe('error mapping (M6)', () => {
     expect(thrown.userMessage).not.toMatch(/internally/);
   });
 
+  it('maps 409 to a context-neutral conflict message (INFO-3c) and hides server detail', async () => {
+    // A 409 can arise from a create-order conflict OR a rejected status change,
+    // so the safe message must read sensibly for BOTH and must not be the old
+    // transition-only phrasing. Exercised here via the create-order path.
+    mockFetch(async () =>
+      jsonResponse(
+        { error: { code: 'CONFLICT', message: 'duplicate order 42 in ledger' } },
+        409
+      )
+    );
+    let thrown;
+    try {
+      await createOrder('100.00', []);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown.status).toBe(409);
+    expect(thrown.userMessage).toBe(
+      'That request conflicts with the current state of the order. Please try again.'
+    );
+    // The stale, create-inappropriate wording must be gone.
+    expect(thrown.userMessage).not.toMatch(/status change is not allowed/i);
+    // M6: no server-provided internal detail leaks into the user-facing text.
+    expect(thrown.userMessage).not.toMatch(/duplicate|ledger|42/i);
+  });
+
   it('maps 5xx to a generic service-unavailable message', async () => {
     mockFetch(async () => new Response('raw stacktrace text', { status: 500 }));
     let thrown;

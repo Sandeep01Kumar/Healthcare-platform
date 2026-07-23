@@ -162,3 +162,94 @@ describe('OrderTrackingPage — safe errors (M6)', () => {
     expect(alert.textContent).toMatch(/no order id/i);
   });
 });
+
+describe('OrderTrackingPage — logical focus after async refresh/retry (MIN-1)', () => {
+  it('does not move focus on the initial mount (router owns focus-on-nav, M12)', async () => {
+    getOrder.mockResolvedValue({ id: 'A', status: 'CREATED' });
+    view = await renderComponent(<OrderTrackingPage orderId="A" />);
+    await flush();
+
+    // This component must NOT focus anything on mount; the one-shot flag is
+    // armed only by a user refresh/retry. (App.jsx owns focus-on-navigation.)
+    const h1 = view.container.querySelector('h1');
+    const refresh = [...view.container.querySelectorAll('button')].find((b) =>
+      /refresh/i.test(b.textContent)
+    );
+    expect(refresh).toBeTruthy();
+    expect(document.activeElement).not.toBe(h1);
+    expect(document.activeElement).not.toBe(refresh);
+  });
+
+  it('restores focus to the Refresh control after a manual refresh settles', async () => {
+    // Deferred promises drive genuinely-distinct `loading` commits (mirroring a
+    // real async network round-trip): the reload must be observed going true
+    // then false across separate flushes, and the second payload is distinct so
+    // `order` actually changes. (A single already-resolved mock would let the
+    // whole round-trip coalesce into a net no-op within one act() drain.)
+    const d1 = deferred();
+    const d2 = deferred();
+    getOrder.mockReturnValueOnce(d1.promise).mockReturnValueOnce(d2.promise);
+
+    view = await renderComponent(<OrderTrackingPage orderId="A" />);
+    d1.resolve({ id: 'A', status: 'CREATED' });
+    await flush();
+
+    const refreshInitial = [...view.container.querySelectorAll('button')].find(
+      (b) => /refresh/i.test(b.textContent)
+    );
+    expect(refreshInitial).toBeTruthy();
+    // Sanity: the mount did not focus the control.
+    expect(document.activeElement).not.toBe(refreshInitial);
+
+    // Activate Refresh: mid-reload the button is disabled and (because `order`
+    // is cleared) unmounts, which drops focus to <body> before the fix.
+    await click(refreshInitial);
+    await flush(); // loading=true committed; the Refresh control has unmounted
+    d2.resolve({ id: 'A', status: 'CONFIRMED' });
+    await flush(); // loading=false committed; focus must return to Refresh
+
+    const refreshAfter = [...view.container.querySelectorAll('button')].find(
+      (b) => /refresh/i.test(b.textContent)
+    );
+    expect(refreshAfter).toBeTruthy();
+    expect(document.activeElement).toBe(refreshAfter);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('restores focus to the Retry control after a failed manual retry settles', async () => {
+    const makeErr = () => {
+      const e = new Error('order-service GET /orders/A failed: 500 (raw)');
+      e.status = 500;
+      e.userMessage =
+        'The order service is temporarily unavailable. Please try again.';
+      return e;
+    };
+    const d1 = deferred();
+    const d2 = deferred();
+    getOrder.mockReturnValueOnce(d1.promise).mockReturnValueOnce(d2.promise);
+
+    view = await renderComponent(<OrderTrackingPage orderId="A" />);
+    d1.reject(makeErr());
+    await flush();
+
+    const retryInitial = [...view.container.querySelectorAll('button')].find(
+      (b) => /retry/i.test(b.textContent)
+    );
+    expect(retryInitial).toBeTruthy();
+
+    // Activate Retry: it unmounts while the reload is in flight. After the
+    // reload fails again, focus must return to the freshly-mounted Retry
+    // control rather than <body>.
+    await click(retryInitial);
+    await flush(); // loading=true committed; the Retry control has unmounted
+    d2.reject(makeErr());
+    await flush(); // loading=false committed (error view); focus must return to Retry
+
+    const retryAfter = [...view.container.querySelectorAll('button')].find((b) =>
+      /retry/i.test(b.textContent)
+    );
+    expect(retryAfter).toBeTruthy();
+    expect(document.activeElement).toBe(retryAfter);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+});

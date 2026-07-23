@@ -1,6 +1,8 @@
 # --- Java / Maven build output ---
 target/
 *.class
+*.jar
+!**/src/**/*.jar
 
 # --- Node / npm ---
 node_modules/
@@ -20,6 +22,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+*~
 
 # --- Logs ---
 *.log
